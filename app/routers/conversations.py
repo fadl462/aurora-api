@@ -160,7 +160,7 @@ def send_message(
 
     conversation.updated_at = models.utcnow()
 
-    reply = generate_reply(payload.content, mode=payload.mode)
+    reply = generate_reply(payload.content, mode=payload.mode, model_choice=payload.model)
     assistant_message = models.Message(
         conversation_id=conversation_id,
         role="assistant",

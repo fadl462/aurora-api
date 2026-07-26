@@ -20,7 +20,7 @@ API docs (auto-generated from the real schemas): http://localhost:8000/docs
 ./venv/bin/pytest tests/ -v
 ```
 
-90 tests, all passing, zero warnings.
+96 tests, all passing.
 
 ## Document upload
 
@@ -44,6 +44,19 @@ export ANTHROPIC_MODEL="claude-sonnet-5"    # optional — defaults to this if u
 Restart the server after setting these. Once set, chat replies are real model output. **Citations and confidence scores stay `null` even with a real model connected** — that's deliberate. A plain model call with no search tool attached has no honest basis for either; fabricating them would be worse than omitting them. Building a real Research Engine with actual search would be the next step to make those fields meaningful.
 
 If the API key is invalid, the model ID doesn't exist, or the Anthropic API is unreachable, the app falls back gracefully to the labeled placeholder rather than returning a 500 — verified with a dedicated test for each failure mode (`tests/test_orchestration.py`).
+
+## Multi-model routing
+
+The chat model picker in the frontend is real, not decorative — the `model` field on `POST /v1/conversations/{id}/messages` is actually threaded through to a real model choice in `app/orchestration.py`:
+
+| Frontend choice | Real Anthropic model | When |
+|---|---|---|
+| `fast` | `claude-haiku-4-5-20251001` | Cheapest, fastest — simple/short asks |
+| `balanced` | `claude-sonnet-5` | Default — solid reasoning, real-time speed |
+| `ultra` | `claude-opus-4-8` | Deepest reasoning, slowest, most expensive |
+| `auto` | one of the above | Chosen automatically by message length as a simple, legible proxy for task complexity — no extra model call spent "deciding" |
+
+We deliberately do **not** expose GPT or Gemini as pickable options anywhere in the product yet — this backend only ever calls Anthropic, and a picker option with no real model behind it would be actively misleading rather than a placeholder worth having.
 
 ## What's real vs. placeholder
 

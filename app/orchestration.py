@@ -35,6 +35,51 @@ DEFAULT_MODEL = "claude-sonnet-5"
 MAX_TOKENS = 1024
 CHARS_PER_ESTIMATED_TOKEN = 4  # rough English-text heuristic, stub path only
 
+# Real multi-model routing. Each key here is what the frontend's model
+# picker actually sends — not a marketing label with nothing behind it.
+# "ultra"/"fast"/"balanced" map to real, distinct Claude models with real
+# cost/latency/capability tradeoffs. We deliberately do NOT list GPT or
+# Gemini as selectable anywhere in the product yet — this file only ever
+# calls Anthropic, and a picker option with no model behind it is worse
+# than not having the option at all.
+MODEL_MAP = {
+    "ultra": "claude-opus-4-8",  # deepest reasoning, slowest, most expensive
+    "balanced": "claude-sonnet-5",  # default — good reasoning, real-time speed
+    "fast": "claude-haiku-4-5-20251001",  # cheapest, fastest, simple tasks
+}
+
+# Auto Mode's routing thresholds. This is a deliberately simple, legible
+# heuristic (message length as a proxy for task complexity) rather than
+# a second model call to "decide" the model — that would burn tokens on
+# every single message just to route it. Simple and honest beats clever
+# and expensive here; these thresholds can be tuned later against real
+# usage data without changing the interface.
+AUTO_FAST_CHAR_CEILING = 200  # short, simple asks -> fast model
+AUTO_ULTRA_CHAR_FLOOR = 2000  # long/complex asks -> deepest model
+
+
+def _resolve_model(model_choice: str | None) -> str:
+    """Turns a frontend model choice into a real Anthropic model ID.
+
+    Unknown or missing values fall back to the env-configured default
+    (ANTHROPIC_MODEL, or DEFAULT_MODEL) rather than erroring or silently
+    auto-routing — a stale frontend build, a direct API call with no
+    model field, or a bad value here should degrade to one predictable
+    model, not a heuristic the caller didn't ask for.
+    """
+    if model_choice and model_choice in MODEL_MAP:
+        return MODEL_MAP[model_choice]
+    return os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+
+
+def _auto_route(user_content: str) -> str:
+    length = len(user_content)
+    if length <= AUTO_FAST_CHAR_CEILING:
+        return MODEL_MAP["fast"]
+    if length >= AUTO_ULTRA_CHAR_FLOOR:
+        return MODEL_MAP["ultra"]
+    return MODEL_MAP["balanced"]
+
 RESEARCH_SYSTEM_PROMPT = (
     "You are a research assistant. Answer clearly and directly. You do not have "
     "live web search in this deployment, so do not invent citations or sources — "
@@ -68,12 +113,16 @@ def _stub_reply(reason: str, user_content: str) -> dict:
     }
 
 
-def generate_reply(user_content: str, mode: str | None = None) -> dict:
+def generate_reply(user_content: str, mode: str | None = None, model_choice: str | None = None) -> dict:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return _stub_reply("no ANTHROPIC_API_KEY configured", user_content)
 
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+    if model_choice == "auto":
+        model = _auto_route(user_content)
+    else:
+        model = _resolve_model(model_choice)
+
     system_prompt = RESEARCH_SYSTEM_PROMPT if mode == "research" else GENERAL_SYSTEM_PROMPT
 
     try:

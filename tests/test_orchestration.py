@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import anthropic
 
-from app.orchestration import generate_reply
+from app.orchestration import DEFAULT_MODEL, generate_reply
 
 
 def test_no_api_key_returns_labeled_stub(monkeypatch):
@@ -101,6 +101,98 @@ def test_general_mode_uses_general_system_prompt(monkeypatch):
 
     _, kwargs = mock_create.call_args
     assert "Aurora" in kwargs["system"]
+
+
+def test_explicit_ultra_choice_maps_to_opus(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("hello", model_choice="ultra")
+
+    assert result["model_used"] == "claude-opus-4-8"
+    _, kwargs = mock_create.call_args
+    assert kwargs["model"] == "claude-opus-4-8"
+
+
+def test_explicit_fast_choice_maps_to_haiku(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("hello", model_choice="fast")
+
+    assert result["model_used"] == "claude-haiku-4-5-20251001"
+
+
+def test_auto_mode_routes_short_message_to_fast_model(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("hi there", model_choice="auto")
+
+    assert result["model_used"] == "claude-haiku-4-5-20251001"
+
+
+def test_auto_mode_routes_long_message_to_ultra_model(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("a" * 2500, model_choice="auto")
+
+    assert result["model_used"] == "claude-opus-4-8"
+
+
+def test_auto_mode_routes_medium_message_to_balanced_model(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("a" * 500, model_choice="auto")
+
+    assert result["model_used"] == "claude-sonnet-5"
+
+
+def test_unrecognized_model_choice_falls_back_to_configured_default(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        result = generate_reply("hello", model_choice="some-old-frontend-value")
+
+    assert result["model_used"] == DEFAULT_MODEL
 
 
 def test_api_status_error_falls_back_to_stub_instead_of_crashing(monkeypatch):
