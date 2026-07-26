@@ -48,6 +48,7 @@ class ProjectOut(BaseModel):
 class DocumentCreate(BaseModel):
     title: str = "Untitled document"
     content: str = ""
+    project_id: Optional[str] = None
 
 
 class DocumentUpdate(BaseModel):
@@ -61,8 +62,26 @@ class DocumentOut(BaseModel):
     id: str
     title: str
     content: str
+    project_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class GeneratedDocumentCreate(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    format: Literal["pptx", "docx", "xlsx"]
+
+
+class GeneratedDocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    format: Literal["pptx", "docx", "xlsx"]
+    prompt: str
+    is_placeholder: bool
+    size_bytes: int
+    created_at: datetime
 
 
 class MessageCreate(BaseModel):

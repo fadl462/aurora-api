@@ -224,3 +224,44 @@ def test_explicit_title_is_not_overwritten_by_auto_title(client, auth_headers):
 
     updated = client.get(f"/v1/conversations/{conv['id']}", headers=headers).json()
     assert updated["title"] == "My chosen title"
+
+
+def test_listing_conversations_with_no_project_id_excludes_project_conversations(client, auth_headers):
+    """Real context wall: a project's chats must never leak into the
+    default/unscoped conversation list, and vice versa."""
+    headers = auth_headers()
+    project = client.post("/v1/projects", json={"name": "JMK Tender Monitor"}, headers=headers).json()
+
+    client.post("/v1/conversations", json={"title": "Personal chat"}, headers=headers)
+    client.post(
+        "/v1/conversations", json={"title": "Project chat", "project_id": project["id"]}, headers=headers
+    )
+
+    unscoped = client.get("/v1/conversations", headers=headers).json()
+    titles = {c["title"] for c in unscoped}
+    assert "Personal chat" in titles
+    assert "Project chat" not in titles
+
+
+def test_listing_conversations_scoped_to_a_project_excludes_personal_conversations(client, auth_headers):
+    headers = auth_headers()
+    project = client.post("/v1/projects", json={"name": "JMK Tender Monitor"}, headers=headers).json()
+
+    client.post("/v1/conversations", json={"title": "Personal chat"}, headers=headers)
+    client.post(
+        "/v1/conversations", json={"title": "Project chat", "project_id": project["id"]}, headers=headers
+    )
+
+    scoped = client.get(f"/v1/conversations?project_id={project['id']}", headers=headers).json()
+    titles = {c["title"] for c in scoped}
+    assert "Project chat" in titles
+    assert "Personal chat" not in titles
+
+
+def test_listing_conversations_for_another_users_project_returns_404(client, auth_headers):
+    headers_a = auth_headers("conv-scope-a@example.com", "correcthorse")
+    headers_b = auth_headers("conv-scope-b@example.com", "correcthorse")
+    project_a = client.post("/v1/projects", json={"name": "Alice's project"}, headers=headers_a).json()
+
+    response = client.get(f"/v1/conversations?project_id={project_a['id']}", headers=headers_b)
+    assert response.status_code == 404

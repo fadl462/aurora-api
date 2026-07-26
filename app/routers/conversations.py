@@ -14,7 +14,9 @@ so ownership isn't leaked via status code.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from .. import auth, models, schemas
@@ -70,12 +72,28 @@ def _derive_title(content: str) -> str:
 
 @router.get("", response_model=list[schemas.ConversationOut])
 def list_conversations(
+    project_id: Optional[str] = Query(
+        None,
+        description=(
+            "Real context wall: omit entirely to see only unscoped/personal "
+            "conversations (project_id IS NULL). Pass a project id to see "
+            "only that project's conversations. This is deliberate — a "
+            "project's chats never bleed into another project's view, or "
+            "into the personal/unscoped view, by design."
+        ),
+    ),
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
+    if project_id is not None:
+        project = db.get(models.Project, project_id)
+        if not project or project.user_id != current_user.id:
+            raise _not_found_generic("project", project_id)
+
     return (
         db.query(models.Conversation)
         .filter(models.Conversation.user_id == current_user.id)
+        .filter(models.Conversation.project_id == project_id)
         .order_by(models.Conversation.updated_at.desc())
         .all()
     )

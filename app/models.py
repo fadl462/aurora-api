@@ -8,7 +8,7 @@ type instead.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, LargeBinary, String, Text
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -43,6 +43,7 @@ class User(Base):
     agents = relationship("Agent", back_populates="user", cascade="all, delete-orphan")
     projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="user", cascade="all, delete-orphan")
+    generated_documents = relationship("GeneratedDocument", back_populates="user", cascade="all, delete-orphan")
 
 
 class Project(Base):
@@ -56,6 +57,7 @@ class Project(Base):
 
     user = relationship("User", back_populates="projects")
     conversations = relationship("Conversation", back_populates="project")
+    documents = relationship("Document", back_populates="project")
 
 
 class Conversation(Base):
@@ -159,9 +161,39 @@ class Document(Base):
 
     id = Column(String, primary_key=True, default=new_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=True)
     title = Column(String, nullable=False, default="Untitled document")
     content = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="documents")
+    project = relationship("Project", back_populates="documents")
+
+
+class GeneratedDocument(Base):
+    """
+    Backs real document generation (app/document_generation.py) — the
+    write-side counterpart to Document above, which only ever backed
+    reading/editing Canvas text. A GeneratedDocument is an actual
+    .pptx/.docx/.xlsx file, stored as bytes and served back for
+    download, not editable plain text.
+
+    Storing bytes directly in the DB row (LargeBinary) rather than the
+    filesystem — see database.py's note on Render's free-tier ephemeral
+    disk; a generated file living only on disk would vanish on the next
+    redeploy, but a DB row survives exactly as long as the database does.
+    """
+
+    __tablename__ = "generated_documents"
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False, default="Untitled")
+    format = Column(String, nullable=False)  # "pptx" | "docx" | "xlsx"
+    prompt = Column(Text, nullable=False)
+    file_data = Column(LargeBinary, nullable=False)
+    is_placeholder = Column(Integer, nullable=False, default=0)  # bool as int for SQLite portability
+    created_at = Column(DateTime, default=utcnow)
+
+    user = relationship("User", back_populates="generated_documents")
