@@ -18,7 +18,12 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
 @router.post("/register", response_model=schemas.UserOut, status_code=201)
 def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
-    user = models.User(email=payload.email.lower().strip(), hashed_password=auth.hash_password(payload.password))
+    name = payload.name.strip() if payload.name and payload.name.strip() else None
+    user = models.User(
+        email=payload.email.lower().strip(),
+        name=name,
+        hashed_password=auth.hash_password(payload.password),
+    )
     db.add(user)
     try:
         db.commit()

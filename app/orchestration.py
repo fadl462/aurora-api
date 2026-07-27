@@ -7,11 +7,15 @@ real, it's an actual model call.
 Three honesty constraints, deliberate:
 
 1. Citations and confidence scores are only ever populated when there's
-   a real basis for them. A plain LLM call with no search tool attached
-   cannot honestly cite sources or score its own confidence — fabricating
-   either would be worse than returning nothing. Real citations/confidence
-   require wiring up an actual search tool (Research Engine), which is a
-   separate, not-yet-built piece — see README "Known limitations."
+   a real basis for them. In general chat mode, there's no search tool
+   attached, so citations/confidence stay null there — fabricating
+   either would be worse than returning nothing. In research mode
+   (mode="research"), a real Anthropic web search tool is attached, so
+   citations there are real search results Claude actually retrieved and
+   cited, not invented. Confidence scores remain null in both modes —
+   citations existing doesn't give us a legitimate way to score
+   confidence, and we're not going to fabricate one just because we can
+   now show sources.
 
 2. Failure is graceful, not fatal. If the API key is missing, invalid, or
    the request fails for any reason, this falls back to a clearly-labeled
@@ -30,6 +34,8 @@ Three honesty constraints, deliberate:
 import os
 
 import anthropic
+
+from .schemas import Citation
 
 DEFAULT_MODEL = "claude-sonnet-5"
 MAX_TOKENS = 1024
@@ -81,15 +87,28 @@ def _auto_route(user_content: str) -> str:
     return MODEL_MAP["balanced"]
 
 RESEARCH_SYSTEM_PROMPT = (
-    "You are a research assistant. Answer clearly and directly. You do not have "
-    "live web search in this deployment, so do not invent citations or sources — "
-    "if the user needs verified, sourced information, say so plainly rather than "
-    "fabricating a reference."
+    "You are a research assistant with a real, live web search tool. Use "
+    "it whenever the question benefits from current, verifiable, or "
+    "citable information — don't answer from memory alone when a search "
+    "would give a better-grounded, sourced answer. Cite what you actually "
+    "find. If search doesn't turn up a clear answer, say so plainly "
+    "rather than guessing or fabricating a source."
 )
 GENERAL_SYSTEM_PROMPT = (
     "You are Aurora, a helpful AI assistant. Be direct and concise unless the "
     "user's question calls for more depth."
 )
+
+# Real web search, only attached in Research mode. This is the Anthropic
+# Messages API's server-side web search tool — Claude decides for itself
+# whether/what to search, retrieves real results, and the API response
+# comes back with real citations attached to the text (see
+# _extract_citations below). This is billed per-search by Anthropic on
+# top of normal token costs, which is why it's capped with max_uses and
+# only ever attached for mode="research", not every chat message.
+WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
+RESEARCH_MAX_SEARCHES = 5
+RESEARCH_MAX_TOKENS = 2048  # a sourced, grounded answer needs more room than a quick chat reply
 
 
 def _estimate_tokens(*texts: str) -> int:
@@ -113,6 +132,40 @@ def _stub_reply(reason: str, user_content: str) -> dict:
     }
 
 
+def _extract_text(content_blocks) -> str:
+    return "".join(getattr(b, "text", "") for b in content_blocks if getattr(b, "type", None) == "text")
+
+
+def _extract_citations(content_blocks) -> list[Citation] | None:
+    """Pulls real web_search_result_location citations off text blocks.
+
+    Only text blocks carry citations (per the Messages API shape); other
+    block types (server_tool_use, web_search_tool_result) are the search
+    mechanics themselves, not citable sources. Deduplicates by URL since
+    the same source is often cited more than once across a long answer.
+    Returns None (not an empty list) when there's nothing to show —
+    "no citations" and "empty citations list" should look the same to
+    callers.
+    """
+    citations: list[Citation] = []
+    seen_urls: set[str] = set()
+
+    for block in content_blocks:
+        if getattr(block, "type", None) != "text":
+            continue
+        for c in getattr(block, "citations", None) or []:
+            if getattr(c, "type", None) != "web_search_result_location":
+                continue
+            url = getattr(c, "url", None)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            title = getattr(c, "title", None)
+            citations.append(Citation(source=f"{title} — {url}" if title else url))
+
+    return citations or None
+
+
 def generate_reply(user_content: str, mode: str | None = None, model_choice: str | None = None) -> dict:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -125,23 +178,37 @@ def generate_reply(user_content: str, mode: str | None = None, model_choice: str
 
     system_prompt = RESEARCH_SYSTEM_PROMPT if mode == "research" else GENERAL_SYSTEM_PROMPT
 
+    # Only research mode gets the search tool — it's billed per-search on
+    # top of normal tokens, and a general chat reply has no business
+    # searching the web on every message.
+    tools = (
+        [{"type": WEB_SEARCH_TOOL_TYPE, "name": "web_search", "max_uses": RESEARCH_MAX_SEARCHES}]
+        if mode == "research"
+        else None
+    )
+
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
+        create_kwargs = dict(
             model=model,
-            max_tokens=MAX_TOKENS,
+            max_tokens=RESEARCH_MAX_TOKENS if mode == "research" else MAX_TOKENS,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
         )
-        text = "".join(block.text for block in response.content if block.type == "text")
+        if tools:
+            create_kwargs["tools"] = tools
+
+        response = client.messages.create(**create_kwargs)
+        text = _extract_text(response.content)
+        citations = _extract_citations(response.content) if mode == "research" else None
         real_tokens = response.usage.input_tokens + response.usage.output_tokens
         return {
             "content": text,
             "model_used": model,
-            # No search tool is wired up yet, so no real citations exist to
-            # return. See the module docstring — this is deliberate, not
-            # an oversight.
-            "citations": None,
+            "citations": citations,
+            # Confidence stays null even with real citations now available
+            # in research mode — having sources doesn't give us a
+            # legitimate way to score confidence, so we don't fabricate one.
             "confidence": None,
             "tokens_used": real_tokens,
             "tokens_are_estimated": False,

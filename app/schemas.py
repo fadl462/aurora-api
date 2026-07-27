@@ -7,7 +7,7 @@ examples and this file are required to stay in sync.
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Citation(BaseModel):
@@ -116,6 +116,7 @@ class ErrorResponse(BaseModel):
 class UserCreate(BaseModel):
     email: str
     password: str = Field(..., min_length=8)
+    name: Optional[str] = Field(None, max_length=80)
 
 
 class UserOut(BaseModel):
@@ -123,6 +124,7 @@ class UserOut(BaseModel):
 
     id: str
     email: str
+    name: Optional[str] = None
     created_at: datetime
 
 
@@ -140,6 +142,21 @@ class UsageOut(BaseModel):
 class ToolSpec(BaseModel):
     name: str
     tier: Literal["read", "low", "medium", "high"]
+
+
+class AgentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    description: str = Field(min_length=1, max_length=300)
+    system_prompt: str = Field(min_length=1, max_length=4000)
+    tools: list[ToolSpec] = []
+
+    @field_validator("name")
+    @classmethod
+    def name_must_have_visible_characters(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("name can't be empty or whitespace-only")
+        return stripped
 
 
 class AgentOut(BaseModel):
@@ -176,3 +193,13 @@ class PendingApprovalOut(BaseModel):
     status: Literal["pending", "approved", "denied"]
     created_at: datetime
     decided_at: Optional[datetime]
+
+
+class PendingApprovalWithAgentOut(PendingApprovalOut):
+    """Same shape as PendingApprovalOut, plus just enough agent context
+    (name/avatar) for a unified inbox to render without a second
+    round-trip per approval to look up which agent it belongs to."""
+
+    agent_name: str
+    agent_avatar_letter: str
+    agent_avatar_color_class: str

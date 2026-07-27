@@ -5,13 +5,20 @@ POST /v1/projects
 Same ownership-scoping pattern as everything else in this API.
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import auth, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/v1/projects", tags=["projects"])
+
+
+def _not_found(project_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail={"error": {"code": "project_not_found", "message": f"No project with id {project_id}"}},
+    )
 
 
 def _to_out(project: models.Project) -> schemas.ProjectOut:
@@ -31,6 +38,18 @@ def list_projects(
 ):
     projects = db.query(models.Project).filter(models.Project.user_id == current_user.id).all()
     return [_to_out(p) for p in projects]
+
+
+@router.get("/{project_id}", response_model=schemas.ProjectOut)
+def get_project(
+    project_id: str,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = db.get(models.Project, project_id)
+    if not project or project.user_id != current_user.id:
+        raise _not_found(project_id)
+    return _to_out(project)
 
 
 @router.post("", response_model=schemas.ProjectOut, status_code=201)

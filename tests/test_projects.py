@@ -84,3 +84,37 @@ def test_conversation_without_project_id_still_works(client, auth_headers):
     response = client.post("/v1/conversations", json={}, headers=headers)
     assert response.status_code == 201
     assert response.json()["project_id"] is None
+
+
+def test_get_single_project(client, auth_headers):
+    headers = auth_headers()
+    created = client.post("/v1/projects", json={"name": "GAYO"}, headers=headers).json()
+
+    response = client.get(f"/v1/projects/{created['id']}", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["name"] == "GAYO"
+
+
+def test_get_nonexistent_project_returns_404(client, auth_headers):
+    headers = auth_headers()
+    response = client.get("/v1/projects/does-not-exist", headers=headers)
+    assert response.status_code == 404
+
+
+def test_get_another_users_project_returns_404(client, auth_headers):
+    headers_a = auth_headers("proj-get-a@example.com", "correcthorse")
+    headers_b = auth_headers("proj-get-b@example.com", "correcthorse")
+    project_a = client.post("/v1/projects", json={"name": "Alice's project"}, headers=headers_a).json()
+
+    response = client.get(f"/v1/projects/{project_a['id']}", headers=headers_b)
+    assert response.status_code == 404
+
+
+def test_get_single_project_reflects_real_thread_count(client, auth_headers):
+    headers = auth_headers()
+    project = client.post("/v1/projects", json={"name": "GAYO"}, headers=headers).json()
+    client.post("/v1/conversations", json={"project_id": project["id"]}, headers=headers)
+    client.post("/v1/conversations", json={"project_id": project["id"]}, headers=headers)
+
+    response = client.get(f"/v1/projects/{project['id']}", headers=headers)
+    assert response.json()["thread_count"] == 2

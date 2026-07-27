@@ -7,6 +7,23 @@ def test_register_creates_user(client):
     assert "hashed_password" not in body  # never leak the hash
 
 
+def test_register_accepts_optional_name(client):
+    response = client.post(
+        "/v1/auth/register",
+        json={"email": "named@example.com", "password": "correcthorse", "name": "Sady"},
+    )
+    assert response.status_code == 201
+    assert response.json()["name"] == "Sady"
+
+
+def test_register_without_name_returns_null_name(client):
+    response = client.post(
+        "/v1/auth/register", json={"email": "noname@example.com", "password": "correcthorse"}
+    )
+    assert response.status_code == 201
+    assert response.json()["name"] is None
+
+
 def test_register_rejects_duplicate_email(client):
     client.post("/v1/auth/register", json={"email": "dupe@example.com", "password": "correcthorse"})
     response = client.post("/v1/auth/register", json={"email": "dupe@example.com", "password": "different"})

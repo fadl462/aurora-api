@@ -2,6 +2,8 @@
 Real endpoints backing the Agents / Agent Console surfaces:
 
   GET  /v1/agents
+  POST /v1/agents                        (create a real user-defined agent)
+  GET  /v1/agents/approvals              (cross-agent inbox — the TopBar bell)
   GET  /v1/agents/{id}
   GET  /v1/agents/{id}/runs
   GET  /v1/agents/{id}/approvals
@@ -43,12 +45,86 @@ def _get_owned_agent(agent_id: str, current_user: models.User, db: Session) -> m
     return agent
 
 
+# Same visual palette used for the seeded starter agents (seed_data.py)
+# — a user-created agent should look native to the product, not like a
+# visually distinct second-class citizen next to the built-in five.
+AVATAR_PALETTE = [
+    "bg-aurora-1/10 text-aurora-1",
+    "bg-aurora-2/10 text-aurora-2",
+    "bg-aurora-3/10 text-aurora-3",
+    "bg-aurora-4/10 text-aurora-4",
+    "bg-warning/10 text-warning",
+]
+
+
 @router.get("", response_model=list[schemas.AgentOut])
 def list_agents(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
     return db.query(models.Agent).filter(models.Agent.user_id == current_user.id).all()
+
+
+@router.post("", response_model=schemas.AgentOut, status_code=201)
+def create_agent(
+    payload: schemas.AgentCreate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    existing_count = db.query(models.Agent).filter(models.Agent.user_id == current_user.id).count()
+    agent = models.Agent(
+        user_id=current_user.id,
+        name=payload.name,
+        description=payload.description,
+        system_prompt=payload.system_prompt,
+        tools=[t.model_dump() for t in payload.tools],
+        # A brand-new agent hasn't done anything yet — "idle" is the
+        # honest starting status, not "active" (that's earned by
+        # actually running, same as the non-Researcher starter agents).
+        status="idle",
+        avatar_letter=payload.name[0].upper(),
+        avatar_color_class=AVATAR_PALETTE[existing_count % len(AVATAR_PALETTE)],
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+@router.get("/approvals", response_model=list[schemas.PendingApprovalWithAgentOut])
+def list_all_pending_approvals(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The real Inbox: every pending approval across every agent this
+    user owns, in one place, oldest first — this is what the TopBar's
+    notification bell actually shows. Must be registered before
+    GET /{agent_id} below, or FastAPI would try to match "approvals"
+    as an agent_id and 404.
+    """
+    rows = (
+        db.query(models.PendingApproval)
+        .join(models.Agent, models.PendingApproval.agent_id == models.Agent.id)
+        .filter(models.Agent.user_id == current_user.id)
+        .filter(models.PendingApproval.status == "pending")
+        .order_by(models.PendingApproval.created_at.asc())
+        .all()
+    )
+    return [
+        schemas.PendingApprovalWithAgentOut(
+            id=row.id,
+            agent_id=row.agent_id,
+            tier=row.tier,
+            action=row.action,
+            status=row.status,
+            created_at=row.created_at,
+            decided_at=row.decided_at,
+            agent_name=row.agent.name,
+            agent_avatar_letter=row.agent.avatar_letter,
+            agent_avatar_color_class=row.agent.avatar_color_class,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/{agent_id}", response_model=schemas.AgentOut)

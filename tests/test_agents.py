@@ -134,3 +134,157 @@ def test_two_users_each_get_their_own_independent_approval(client, auth_headers)
     approvals_b = client.get(f"/v1/agents/{researcher_b['id']}/approvals", headers=headers_b).json()
     assert len(approvals_b) == 1
     assert approvals_b[0]["status"] == "pending"
+
+
+def test_inbox_returns_pending_approvals_across_all_agents(client, auth_headers):
+    """The real point of the inbox: one call surfaces every pending
+    approval this user has, not just one agent's."""
+    headers = auth_headers()
+    inbox = client.get("/v1/agents/approvals", headers=headers).json()
+    assert len(inbox) == 1
+    assert inbox[0]["agent_name"] == "Researcher"
+    assert inbox[0]["status"] == "pending"
+    assert "agent_avatar_letter" in inbox[0]
+    assert "agent_avatar_color_class" in inbox[0]
+
+
+def test_inbox_excludes_decided_approvals(client, auth_headers):
+    headers = auth_headers()
+    agents = client.get("/v1/agents", headers=headers).json()
+    researcher = next(a for a in agents if a["name"] == "Researcher")
+    approval = client.get(f"/v1/agents/{researcher['id']}/approvals", headers=headers).json()[0]
+
+    client.post(f"/v1/agents/{researcher['id']}/approvals/{approval['id']}/approve", headers=headers)
+
+    inbox = client.get("/v1/agents/approvals", headers=headers).json()
+    assert inbox == []
+
+
+def test_inbox_only_shows_the_current_users_approvals(client, auth_headers):
+    headers_a = auth_headers("inbox-a@example.com", "correcthorse")
+    headers_b = auth_headers("inbox-b@example.com", "correcthorse")
+
+    inbox_a = client.get("/v1/agents/approvals", headers=headers_a).json()
+    inbox_b = client.get("/v1/agents/approvals", headers=headers_b).json()
+
+    assert len(inbox_a) == 1
+    assert len(inbox_b) == 1
+    assert inbox_a[0]["id"] != inbox_b[0]["id"]
+
+
+def test_inbox_requires_auth(client):
+    response = client.get("/v1/agents/approvals")
+    assert response.status_code == 401
+
+
+def test_inbox_route_is_not_shadowed_by_agent_id_route(client, auth_headers):
+    """Regression guard: GET /v1/agents/approvals must resolve to the
+    inbox endpoint, not be swallowed by GET /{agent_id} treating
+    "approvals" as an agent id and 404ing."""
+    headers = auth_headers()
+    response = client.get("/v1/agents/approvals", headers=headers)
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+
+
+def test_create_agent_appears_in_list(client, auth_headers):
+    headers = auth_headers()
+    response = client.post(
+        "/v1/agents",
+        json={
+            "name": "Contract Reviewer",
+            "description": "Flags risky clauses in vendor contracts.",
+            "system_prompt": "You review contracts for unusual liability terms.",
+            "tools": [{"name": "pdf_extract", "tier": "read"}],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 201
+    created = response.json()
+    assert created["name"] == "Contract Reviewer"
+    assert created["status"] == "idle"  # a new agent hasn't earned "active" yet
+    assert created["avatar_letter"] == "C"
+
+    agents = client.get("/v1/agents", headers=headers).json()
+    names = {a["name"] for a in agents}
+    assert "Contract Reviewer" in names
+    assert len(agents) == 6  # 5 seeded + 1 created
+
+
+def test_create_agent_defaults_to_no_tools(client, auth_headers):
+    headers = auth_headers()
+    response = client.post(
+        "/v1/agents",
+        json={"name": "Minimal Agent", "description": "Bare minimum.", "system_prompt": "Do the thing."},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    assert response.json()["tools"] == []
+
+
+def test_create_agent_rejects_empty_name(client, auth_headers):
+    headers = auth_headers()
+    response = client.post(
+        "/v1/agents",
+        json={"name": "", "description": "x", "system_prompt": "x"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_create_agent_rejects_whitespace_only_name(client, auth_headers):
+    headers = auth_headers()
+    response = client.post(
+        "/v1/agents",
+        json={"name": "   ", "description": "x", "system_prompt": "x"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_create_agent_strips_surrounding_whitespace_from_name(client, auth_headers):
+    headers = auth_headers()
+    response = client.post(
+        "/v1/agents",
+        json={"name": "  Padded Name  ", "description": "x", "system_prompt": "x"},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    assert response.json()["name"] == "Padded Name"
+
+
+def test_create_agent_requires_auth(client):
+    response = client.post(
+        "/v1/agents", json={"name": "x", "description": "x", "system_prompt": "x"}
+    )
+    assert response.status_code == 401
+
+
+def test_created_agents_are_owned_and_isolated_per_user(client, auth_headers):
+    headers_a = auth_headers("create-agent-a@example.com", "correcthorse")
+    headers_b = auth_headers("create-agent-b@example.com", "correcthorse")
+
+    client.post(
+        "/v1/agents",
+        json={"name": "Alice Only Agent", "description": "x", "system_prompt": "x"},
+        headers=headers_a,
+    )
+
+    agents_b = client.get("/v1/agents", headers=headers_b).json()
+    assert "Alice Only Agent" not in {a["name"] for a in agents_b}
+
+
+def test_created_agent_avatar_colors_rotate(client, auth_headers):
+    """Not a strict requirement on the exact palette, just that
+    successive created agents don't all collapse to one identical
+    color, which would make them hard to tell apart at a glance."""
+    headers = auth_headers()
+    colors = set()
+    for i in range(3):
+        response = client.post(
+            "/v1/agents",
+            json={"name": f"Agent {i}", "description": "x", "system_prompt": "x"},
+            headers=headers,
+        )
+        colors.add(response.json()["avatar_color_class"])
+    assert len(colors) > 1

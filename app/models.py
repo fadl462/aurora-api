@@ -35,6 +35,7 @@ class User(Base):
 
     id = Column(String, primary_key=True, default=new_uuid)
     email = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
     token_balance = Column(Integer, nullable=False, default=STARTING_TOKEN_BALANCE)
     created_at = Column(DateTime, default=utcnow)

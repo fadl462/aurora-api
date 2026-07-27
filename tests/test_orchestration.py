@@ -87,6 +87,108 @@ def test_research_mode_uses_research_system_prompt(monkeypatch):
     assert "live web search" in kwargs["system"]
 
 
+def test_research_mode_attaches_real_web_search_tool(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        generate_reply("what's new in AI this week", mode="research")
+
+    _, kwargs = mock_create.call_args
+    assert kwargs["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
+
+
+def test_general_mode_never_attaches_web_search_tool(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    fake_response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        mock_create = MockClient.return_value.messages.create
+        mock_create.return_value = fake_response
+        generate_reply("hello", mode=None)
+
+    _, kwargs = mock_create.call_args
+    assert "tools" not in kwargs
+
+
+def test_research_mode_extracts_real_citations_from_search_results(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    citation = SimpleNamespace(
+        type="web_search_result_location",
+        url="https://en.wikipedia.org/wiki/Claude_Shannon",
+        title="Claude Shannon - Wikipedia",
+    )
+    text_block = SimpleNamespace(
+        type="text",
+        text="Claude Shannon was born in 1916.",
+        citations=[citation],
+    )
+    fake_response = SimpleNamespace(
+        content=[text_block],
+        usage=SimpleNamespace(input_tokens=20, output_tokens=15),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = fake_response
+        result = generate_reply("who was claude shannon", mode="research")
+
+    assert result["citations"] is not None
+    assert len(result["citations"]) == 1
+    assert "en.wikipedia.org" in result["citations"][0].source
+    assert result["confidence"] is None  # still never fabricated, even with real citations
+
+
+def test_research_mode_deduplicates_repeated_citations(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    same_citation = SimpleNamespace(
+        type="web_search_result_location", url="https://example.com/article", title="Example Article"
+    )
+    text_blocks = [
+        SimpleNamespace(type="text", text="First claim.", citations=[same_citation]),
+        SimpleNamespace(type="text", text="Second claim, same source.", citations=[same_citation]),
+    ]
+    fake_response = SimpleNamespace(
+        content=text_blocks,
+        usage=SimpleNamespace(input_tokens=10, output_tokens=10),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = fake_response
+        result = generate_reply("tell me about this", mode="research")
+
+    assert len(result["citations"]) == 1
+
+
+def test_general_mode_never_returns_citations_even_if_present_on_response(monkeypatch):
+    """Belt-and-suspenders: even if a response somehow carried citation-like
+    data, general (non-research) mode must never surface it — no search
+    tool was attached, so there's no honest basis for a citation there."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    citation = SimpleNamespace(type="web_search_result_location", url="https://example.com", title="Example")
+    text_block = SimpleNamespace(type="text", text="ok", citations=[citation])
+    fake_response = SimpleNamespace(
+        content=[text_block],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+    )
+
+    with patch("app.orchestration.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = fake_response
+        result = generate_reply("hello", mode=None)
+
+    assert result["citations"] is None
+
+
 def test_general_mode_uses_general_system_prompt(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
     fake_response = SimpleNamespace(

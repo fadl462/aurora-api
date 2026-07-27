@@ -41,9 +41,15 @@ export ANTHROPIC_API_KEY="sk-ant-..."      # your own key from console.anthropic
 export ANTHROPIC_MODEL="claude-sonnet-5"    # optional — defaults to this if unset
 ```
 
-Restart the server after setting these. Once set, chat replies are real model output. **Citations and confidence scores stay `null` even with a real model connected** — that's deliberate. A plain model call with no search tool attached has no honest basis for either; fabricating them would be worse than omitting them. Building a real Research Engine with actual search would be the next step to make those fields meaningful.
+Restart the server after setting these. Once set, chat replies are real model output. **Citations and confidence scores stay `null` in general chat mode** — that's deliberate. A plain model call with no search tool attached has no honest basis for either; fabricating them would be worse than omitting them. See "Research Engine" below for where citations do become real.
 
 If the API key is invalid, the model ID doesn't exist, or the Anthropic API is unreachable, the app falls back gracefully to the labeled placeholder rather than returning a 500 — verified with a dedicated test for each failure mode (`tests/test_orchestration.py`).
+
+## Research Engine
+
+`mode="research"` on `POST /v1/conversations/{id}/messages` (used by the frontend's Research page) attaches Anthropic's real server-side web search tool (`web_search_20260209`) — Claude decides for itself whether/what to search, retrieves real results, and the response comes back with real citations attached to specific claims. `app/orchestration.py` extracts those into the same `Citation` shape the API already returns, deduplicated by URL.
+
+General chat mode (no `mode`, or any mode other than `"research"`) never attaches this tool — a plain chat reply has no business searching the web on every message, and Anthropic bills web search per-search on top of normal tokens. Confidence scores stay `null` in both modes — having real citations doesn't give us a legitimate way to score confidence, so we don't fabricate one just because we can now show sources.
 
 ## Multi-model routing
 
@@ -60,9 +66,9 @@ We deliberately do **not** expose GPT or Gemini as pickable options anywhere in 
 
 ## What's real vs. placeholder
 
-**Real:** the database layer (SQLAlchemy models, actual persistence — verified with real HTTP requests, not mocked), the full request/response contract from the API spec, error handling with the documented `{error: {code, message, request_id}}` shape, input validation, bcrypt password hashing + JWT sessions, ownership-scoped conversations/agents/projects/documents (each with a dedicated cross-user-isolation test), a real Anthropic model integration with graceful failure handling, real document CRUD backing the Canvas surface, real per-account token usage tracking with hard enforcement at zero, real file upload and text extraction (PDF/Word/PowerPoint/Excel/code files), and a 90-test suite.
+**Real:** the database layer (SQLAlchemy models, actual persistence — verified with real HTTP requests, not mocked), the full request/response contract from the API spec, error handling with the documented `{error: {code, message, request_id}}` shape, input validation, bcrypt password hashing + JWT sessions, ownership-scoped conversations/agents/projects/documents (each with a dedicated cross-user-isolation test), real project-scoped context walls for conversations and documents, a real Anthropic model integration with graceful failure handling and real multi-model routing, a real Research Engine with Anthropic's web search tool and real extracted citations, real document CRUD backing the Canvas surface, real document *generation* (`.pptx`/`.docx`/`.xlsx` from a prompt, downloadable), real per-account token usage tracking with hard enforcement at zero, real file upload and text extraction (PDF/Word/PowerPoint/Excel/code files), and a 125-test suite.
 
-**Placeholder, by design:** citations and confidence scores are always `null` — see above. There's no real web search / Research Engine yet. No SSO/MFA (`docs/07-security-and-compliance.md`) — email/password only.
+**Placeholder, by design:** confidence scores are always `null` — see "Research Engine" above for why. No SSO/MFA (`docs/07-security-and-compliance.md`) — email/password only.
 
 ## Deploying (Render)
 
@@ -85,5 +91,4 @@ We deliberately do **not** expose GPT or Gemini as pickable options anywhere in 
 - `AURORA_SECRET_KEY` defaults to an insecure dev value with a loud warning if unset — always set a real one before deploying anywhere.
 - SQLite by default — see the Render section above for why this matters for deployment specifically.
 - Auth is email/password only — no SSO/MFA yet.
-- No real search tool — see "Connecting a real model" above for why citations stay honestly empty rather than fabricated.
 - Token pricing/balances are a placeholder figure, not tied to any real billing plan yet.
