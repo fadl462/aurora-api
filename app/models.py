@@ -45,6 +45,7 @@ class User(Base):
     projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="user", cascade="all, delete-orphan")
     generated_documents = relationship("GeneratedDocument", back_populates="user", cascade="all, delete-orphan")
+    login_events = relationship("LoginEvent", back_populates="user", cascade="all, delete-orphan")
 
 
 class Project(Base):
@@ -198,3 +199,31 @@ class GeneratedDocument(Base):
     created_at = Column(DateTime, default=utcnow)
 
     user = relationship("User", back_populates="generated_documents")
+
+
+class LoginEvent(Base):
+    """A real record of each successful login, powering the Settings
+    page's 'Recent sign-ins' list — the honest way to answer 'where is
+    someone accessing this from': a transparent, user-visible security
+    log, not covert tracking.
+
+    ip_address is stored for the geolocation lookup and potential abuse
+    investigation, but deliberately never returned by the API — see
+    LoginEventOut in schemas.py. What the person actually needs is the
+    derived device/location labels, not their own raw IP echoed back.
+    """
+
+    __tablename__ = "login_events"
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    ip_address = Column(String, nullable=False)
+    user_agent = Column(String, nullable=True)
+    device_label = Column(String, nullable=False, default="Unknown device")
+    # Null, not a fabricated placeholder, when geolocation genuinely
+    # couldn't be resolved (private/dev IP, lookup timeout, lookup
+    # failure) — see resolve_location() in routers/auth.py.
+    location_label = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    user = relationship("User", back_populates="login_events")

@@ -82,3 +82,191 @@ def test_me_returns_current_user_with_valid_token(client):
 def test_me_rejects_garbage_token(client):
     response = client.get("/v1/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
     assert response.status_code == 401
+
+
+def test_update_me_sets_a_new_name(client, auth_headers):
+    headers = auth_headers()
+    response = client.patch("/v1/auth/me", json={"name": "Sady"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["name"] == "Sady"
+
+    # Persisted, not just echoed back — confirm via a fresh GET.
+    me = client.get("/v1/auth/me", headers=headers).json()
+    assert me["name"] == "Sady"
+
+
+def test_update_me_strips_surrounding_whitespace(client, auth_headers):
+    headers = auth_headers()
+    response = client.patch("/v1/auth/me", json={"name": "  Padded  "}, headers=headers)
+    assert response.json()["name"] == "Padded"
+
+
+def test_update_me_with_empty_string_clears_name_back_to_null(client, auth_headers):
+    headers = auth_headers()
+    client.patch("/v1/auth/me", json={"name": "Sady"}, headers=headers)
+    response = client.patch("/v1/auth/me", json={"name": ""}, headers=headers)
+    assert response.json()["name"] is None
+
+
+def test_update_me_with_whitespace_only_also_clears_name(client, auth_headers):
+    headers = auth_headers()
+    client.patch("/v1/auth/me", json={"name": "Sady"}, headers=headers)
+    response = client.patch("/v1/auth/me", json={"name": "   "}, headers=headers)
+    assert response.json()["name"] is None
+
+
+def test_update_me_with_no_name_field_leaves_existing_name_untouched(client, auth_headers):
+    headers = auth_headers()
+    client.patch("/v1/auth/me", json={"name": "Sady"}, headers=headers)
+    response = client.patch("/v1/auth/me", json={}, headers=headers)
+    assert response.json()["name"] == "Sady"
+
+
+def test_update_me_requires_auth(client):
+    response = client.patch("/v1/auth/me", json={"name": "Sady"})
+    assert response.status_code == 401
+
+
+def test_update_me_does_not_affect_other_users(client, auth_headers):
+    headers_a = auth_headers("name-a@example.com", "correcthorse")
+    headers_b = auth_headers("name-b@example.com", "correcthorse")
+
+    client.patch("/v1/auth/me", json={"name": "Alice"}, headers=headers_a)
+
+    me_b = client.get("/v1/auth/me", headers=headers_b).json()
+    assert me_b["name"] is None
+
+
+def test_login_records_a_real_login_event(client, auth_headers):
+    headers = auth_headers()
+    sessions = client.get("/v1/auth/sessions", headers=headers).json()
+    assert len(sessions) == 1
+    assert sessions[0]["device_label"]  # non-empty — some label was derived
+    assert "id" in sessions[0]
+    assert "created_at" in sessions[0]
+
+
+def test_login_event_never_exposes_raw_ip_or_user_agent(client, auth_headers):
+    """The person needs 'was this me,' not their own IP echoed back —
+    ip_address/user_agent are logged server-side but must never appear
+    in the API response (see LoginEventOut in schemas.py)."""
+    headers = auth_headers()
+    sessions = client.get("/v1/auth/sessions", headers=headers).json()
+    assert "ip_address" not in sessions[0]
+    assert "user_agent" not in sessions[0]
+
+
+def test_sessions_requires_auth(client):
+    response = client.get("/v1/auth/sessions")
+    assert response.status_code == 401
+
+
+def test_sessions_only_shows_current_users_own_events(client, auth_headers):
+    headers_a = auth_headers("sessions-a@example.com", "correcthorse")
+    headers_b = auth_headers("sessions-b@example.com", "correcthorse")
+
+    sessions_a = client.get("/v1/auth/sessions", headers=headers_a).json()
+    sessions_b = client.get("/v1/auth/sessions", headers=headers_b).json()
+
+    assert len(sessions_a) == 1
+    assert len(sessions_b) == 1
+    assert sessions_a[0]["id"] != sessions_b[0]["id"]
+
+
+def test_sessions_ordered_most_recent_first(client):
+    client.post("/v1/auth/register", json={"email": "multi-login@example.com", "password": "correcthorse"})
+    login1 = client.post(
+        "/v1/auth/login", data={"username": "multi-login@example.com", "password": "correcthorse"}
+    )
+    headers = {"Authorization": f"Bearer {login1.json()['access_token']}"}
+
+    login2 = client.post(
+        "/v1/auth/login", data={"username": "multi-login@example.com", "password": "correcthorse"}
+    )
+    headers2 = {"Authorization": f"Bearer {login2.json()['access_token']}"}
+
+    sessions = client.get("/v1/auth/sessions", headers=headers2).json()
+    assert len(sessions) == 2
+    # Most recent first: the second login's event should sort before the first's.
+    assert sessions[0]["created_at"] >= sessions[1]["created_at"]
+
+
+def test_device_label_reflects_the_actual_user_agent_sent(client):
+    client.post("/v1/auth/register", json={"email": "ua-test@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login",
+        data={"username": "ua-test@example.com", "password": "correcthorse"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    sessions = client.get("/v1/auth/sessions", headers=headers).json()
+    assert sessions[0]["device_label"] == "Chrome on Windows"
+
+
+def test_login_from_private_test_client_leaves_location_unresolved(client, auth_headers):
+    """The test client's connection doesn't have a real public IP, so
+    location_label should honestly be null — not a fabricated place."""
+    headers = auth_headers()
+    sessions = client.get("/v1/auth/sessions", headers=headers).json()
+    assert sessions[0]["location_label"] is None
+
+
+def test_background_location_resolution_updates_the_event(monkeypatch, db_session):
+    """Exercises _resolve_and_store_location directly, since the real
+    background task uses app.database.SessionLocal (the production
+    session factory) rather than the test's overridden in-memory
+    session — by design, this is the one path that needs a direct unit
+    test rather than a full HTTP round trip."""
+    from app.routers import auth as auth_router
+    from app import models
+    import conftest as conftest_module
+
+    user = models.User(email="bg-loc@example.com", hashed_password="x")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    event = models.LoginEvent(
+        user_id=user.id, ip_address="8.8.8.8", device_label="Chrome on Windows", location_label=None
+    )
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    monkeypatch.setattr(auth_router, "SessionLocal", conftest_module.TestingSessionLocal)
+    monkeypatch.setattr(auth_router.login_activity, "resolve_location", lambda ip: "Mountain View, California, US")
+
+    auth_router._resolve_and_store_location(event.id, "8.8.8.8")
+
+    db_session.refresh(event)
+    assert event.location_label == "Mountain View, California, US"
+
+
+def test_background_location_resolution_leaves_event_untouched_on_lookup_failure(monkeypatch, db_session):
+    from app.routers import auth as auth_router
+    from app import models
+    import conftest as conftest_module
+
+    user = models.User(email="bg-loc-fail@example.com", hashed_password="x")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    event = models.LoginEvent(
+        user_id=user.id, ip_address="8.8.8.8", device_label="Chrome on Windows", location_label=None
+    )
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    monkeypatch.setattr(auth_router, "SessionLocal", conftest_module.TestingSessionLocal)
+    monkeypatch.setattr(auth_router.login_activity, "resolve_location", lambda ip: None)
+
+    auth_router._resolve_and_store_location(event.id, "8.8.8.8")
+
+    db_session.refresh(event)
+    assert event.location_label is None

@@ -128,6 +128,29 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class UserUpdate(BaseModel):
+    # Optional[str] with no Field(min_length=...) deliberately — an
+    # empty string here means "clear my name back to the email-derived
+    # default," which is a legitimate real choice, not invalid input.
+    # The router strips and treats whitespace-only the same way.
+    name: Optional[str] = None
+
+
+class LoginEventOut(BaseModel):
+    """Deliberately does NOT include ip_address or user_agent — the
+    person needs to recognize "was this me," which the derived
+    device/location labels answer; their own raw IP echoed back adds
+    no value and is unnecessary exposure of data already logged
+    server-side for security purposes."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    device_label: str
+    location_label: Optional[str] = None
+    created_at: datetime
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
