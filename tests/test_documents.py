@@ -165,3 +165,151 @@ def test_listing_documents_for_another_users_project_returns_404(client, auth_he
 
     response = client.get(f"/v1/documents?project_id={project_a['id']}", headers=headers_b)
     assert response.status_code == 404
+
+
+def test_first_edit_snapshots_the_original_content(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "Original text"}, headers=headers).json()
+
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "Edited text"}, headers=headers)
+
+    versions = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    assert len(versions) == 1
+    assert versions[0]["content"] == "Original text"
+
+
+def test_identical_content_does_not_create_a_version(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "Same text"}, headers=headers).json()
+
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "Same text"}, headers=headers)
+
+    versions = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    assert versions == []
+
+
+def test_rapid_successive_edits_are_throttled_to_one_snapshot(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "v1"}, headers=headers).json()
+
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v2"}, headers=headers)  # snapshots "v1"
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v3"}, headers=headers)  # too soon — no new snapshot
+
+    versions = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    assert len(versions) == 1
+    assert versions[0]["content"] == "v1"
+
+
+def test_a_new_snapshot_is_taken_once_the_throttle_window_has_elapsed(client, auth_headers, db_session):
+    from datetime import datetime, timedelta, timezone
+    from app import models
+
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "v1"}, headers=headers).json()
+
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v2"}, headers=headers)  # snapshots "v1"
+
+    # Backdate the one existing version past the throttle window, as if
+    # real time had actually passed, rather than making the test slow.
+    version = db_session.query(models.DocumentVersion).filter_by(document_id=doc["id"]).first()
+    version.created_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db_session.commit()
+
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v3"}, headers=headers)  # snapshots "v2"
+
+    versions = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    assert len(versions) == 2
+    contents = {v["content"] for v in versions}
+    assert contents == {"v1", "v2"}
+
+
+def test_versions_ordered_most_recent_first(client, auth_headers, db_session):
+    from datetime import datetime, timedelta, timezone
+    from app import models
+
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "v1"}, headers=headers).json()
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v2"}, headers=headers)
+
+    version = db_session.query(models.DocumentVersion).filter_by(document_id=doc["id"]).first()
+    version.created_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db_session.commit()
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "v3"}, headers=headers)
+
+    versions = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    assert versions[0]["content"] == "v2"  # most recently snapshotted
+    assert versions[1]["content"] == "v1"
+
+
+def test_versions_requires_auth(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft"}, headers=headers).json()
+    response = client.get(f"/v1/documents/{doc['id']}/versions")
+    assert response.status_code == 401
+
+
+def test_versions_of_another_users_document_returns_404(client, auth_headers):
+    headers_a = auth_headers("ver-a@example.com", "correcthorse")
+    headers_b = auth_headers("ver-b@example.com", "correcthorse")
+    doc = client.post("/v1/documents", json={"title": "Alice's doc"}, headers=headers_a).json()
+
+    response = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers_b)
+    assert response.status_code == 404
+
+
+def test_restore_applies_the_old_content(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "Original"}, headers=headers).json()
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "Changed"}, headers=headers)
+
+    version = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()[0]
+    restored = client.post(f"/v1/documents/{doc['id']}/versions/{version['id']}/restore", headers=headers).json()
+
+    assert restored["content"] == "Original"
+
+
+def test_restore_snapshots_the_pre_restore_state_first(client, auth_headers):
+    """Restoring is itself undoable — what was live right before the
+    restore must not be lost."""
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "Original"}, headers=headers).json()
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "Changed"}, headers=headers)
+
+    version = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()[0]
+    client.post(f"/v1/documents/{doc['id']}/versions/{version['id']}/restore", headers=headers)
+
+    versions_after = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()
+    contents = {v["content"] for v in versions_after}
+    assert "Changed" in contents  # the pre-restore state, preserved
+    assert "Original" in contents
+
+
+def test_restore_unknown_version_returns_404(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft"}, headers=headers).json()
+    response = client.post(f"/v1/documents/{doc['id']}/versions/not-a-real-id/restore", headers=headers)
+    assert response.status_code == 404
+
+
+def test_restore_rejects_a_version_belonging_to_a_different_document(client, auth_headers):
+    headers = auth_headers()
+    doc_a = client.post("/v1/documents", json={"title": "A", "content": "A original"}, headers=headers).json()
+    doc_b = client.post("/v1/documents", json={"title": "B", "content": "B original"}, headers=headers).json()
+    client.put(f"/v1/documents/{doc_a['id']}", json={"content": "A changed"}, headers=headers)
+
+    version_of_a = client.get(f"/v1/documents/{doc_a['id']}/versions", headers=headers).json()[0]
+
+    response = client.post(
+        f"/v1/documents/{doc_b['id']}/versions/{version_of_a['id']}/restore", headers=headers
+    )
+    assert response.status_code == 404
+
+
+def test_restore_requires_auth(client, auth_headers):
+    headers = auth_headers()
+    doc = client.post("/v1/documents", json={"title": "Draft", "content": "x"}, headers=headers).json()
+    client.put(f"/v1/documents/{doc['id']}", json={"content": "y"}, headers=headers)
+    version = client.get(f"/v1/documents/{doc['id']}/versions", headers=headers).json()[0]
+
+    response = client.post(f"/v1/documents/{doc['id']}/versions/{version['id']}/restore")
+    assert response.status_code == 401

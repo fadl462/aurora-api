@@ -22,11 +22,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Starting token allowance for a new account. This is a placeholder
-# figure for local development — a real product would tie this to a
-# billing plan (docs/02-product-requirements.md's tiers), not a
-# hardcoded constant. Real, current usage from real API calls is what
-# actually decrements this — see app/orchestration.py.
+# Starting token allowance for a new (free-tier) account. Kept in sync
+# with app/billing.py's "free" Plan.token_allowance — that's the real
+# source of truth for all plan tiers now; this constant exists because
+# a brand-new user needs a starting balance before any plan logic runs
+# at all (e.g. before their first login/session even happens).
 STARTING_TOKEN_BALANCE = 50_000
 
 
@@ -38,6 +38,13 @@ class User(Base):
     name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
     token_balance = Column(Integer, nullable=False, default=STARTING_TOKEN_BALANCE)
+    # "free" until a real Stripe checkout actually completes — see
+    # app/billing.py and the webhook handler in routers/billing.py.
+    # Never set directly from client input; only the webhook (which
+    # verifies Stripe's signature) or an admin action should change this.
+    plan_tier = Column(String, nullable=False, default="free")
+    stripe_customer_id = Column(String, nullable=True, unique=True)
+    stripe_subscription_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
@@ -46,6 +53,7 @@ class User(Base):
     documents = relationship("Document", back_populates="user", cascade="all, delete-orphan")
     generated_documents = relationship("GeneratedDocument", back_populates="user", cascade="all, delete-orphan")
     login_events = relationship("LoginEvent", back_populates="user", cascade="all, delete-orphan")
+    refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
 
 
 class Project(Base):
@@ -153,10 +161,7 @@ class PendingApproval(Base):
 class Document(Base):
     """
     Backs the Canvas surface's Document panel — a real, persisted,
-    user-editable document, distinct from a conversation. Deliberately
-    plain (title + content, no versioning/rich-text yet) — this is the
-    smallest real slice that makes Canvas an actual document workspace
-    rather than a static mockup of one.
+    user-editable document, distinct from a conversation.
     """
 
     __tablename__ = "documents"
@@ -171,6 +176,31 @@ class Document(Base):
 
     user = relationship("User", back_populates="documents")
     project = relationship("Project", back_populates="documents")
+    versions = relationship(
+        "DocumentVersion", back_populates="document", cascade="all, delete-orphan", order_by="desc(DocumentVersion.created_at)"
+    )
+
+
+class DocumentVersion(Base):
+    """A real snapshot of a Document's prior state, taken before an
+    update overwrites it — this is what makes Canvas's autosave safe
+    rather than a one-way door. See routers/documents.py's
+    update_document for exactly when a snapshot gets taken: not on
+    every single autosave tick (that would flood the table for no
+    real benefit, since most autosaves are seconds apart mid-sentence),
+    but throttled to one snapshot per VERSION_SNAPSHOT_MIN_INTERVAL, so
+    the history reads like meaningful checkpoints rather than a keystroke
+    log."""
+
+    __tablename__ = "document_versions"
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=False)
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+    document = relationship("Document", back_populates="versions")
 
 
 class GeneratedDocument(Base):
@@ -227,3 +257,27 @@ class LoginEvent(Base):
     created_at = Column(DateTime, default=utcnow)
 
     user = relationship("User", back_populates="login_events")
+
+
+class RefreshToken(Base):
+    """Backs real 'stay logged in' sessions. Only ever stores a hash of
+    the actual token (see auth.py's _hash_refresh_token) — same
+    principle as password storage: the raw value exists only in the
+    client's hands and briefly in memory at issuance time.
+
+    login_event_id ties a refresh token back to the LoginEvent it was
+    issued alongside, so a future 'sign out this device' feature on the
+    Settings page's sign-in list has something concrete to revoke.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    login_event_id = Column(String, ForeignKey("login_events.id"), nullable=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="refresh_tokens")

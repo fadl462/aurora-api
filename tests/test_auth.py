@@ -137,6 +137,208 @@ def test_update_me_does_not_affect_other_users(client, auth_headers):
     assert me_b["name"] is None
 
 
+def test_sign_out_device_revokes_that_sessions_refresh_token(client):
+    client.post("/v1/auth/register", json={"email": "signout@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login", data={"username": "signout@example.com", "password": "correcthorse"}
+    ).json()
+    headers = {"Authorization": f"Bearer {login['access_token']}"}
+    refresh_token = login["refresh_token"]
+
+    event_id = client.get("/v1/auth/sessions", headers=headers).json()[0]["id"]
+
+    response = client.delete(f"/v1/auth/sessions/{event_id}", headers=headers)
+    assert response.status_code == 204
+
+    # The refresh token issued alongside that login must now be dead.
+    refresh_response = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert refresh_response.status_code == 401
+
+
+def test_sign_out_device_keeps_the_login_event_as_history(client, auth_headers):
+    headers = auth_headers()
+    event_id = client.get("/v1/auth/sessions", headers=headers).json()[0]["id"]
+
+    client.delete(f"/v1/auth/sessions/{event_id}", headers=headers)
+
+    sessions = client.get("/v1/auth/sessions", headers=headers).json()
+    assert any(s["id"] == event_id for s in sessions)  # still there — it's a history record, not deleted
+
+
+def test_sign_out_device_requires_auth(client):
+    response = client.delete("/v1/auth/sessions/some-id")
+    assert response.status_code == 401
+
+
+def test_sign_out_device_rejects_another_users_login_event(client, auth_headers):
+    headers_a = auth_headers("signout-a@example.com", "correcthorse")
+    headers_b = auth_headers("signout-b@example.com", "correcthorse")
+
+    event_a = client.get("/v1/auth/sessions", headers=headers_a).json()[0]["id"]
+
+    response = client.delete(f"/v1/auth/sessions/{event_a}", headers=headers_b)
+    assert response.status_code == 404
+
+
+def test_sign_out_device_on_unknown_id_returns_404(client, auth_headers):
+    headers = auth_headers()
+    response = client.delete("/v1/auth/sessions/not-a-real-id", headers=headers)
+    assert response.status_code == 404
+
+
+def test_sign_out_device_twice_is_idempotent(client, auth_headers):
+    headers = auth_headers()
+    event_id = client.get("/v1/auth/sessions", headers=headers).json()[0]["id"]
+
+    first = client.delete(f"/v1/auth/sessions/{event_id}", headers=headers)
+    second = client.delete(f"/v1/auth/sessions/{event_id}", headers=headers)
+    assert first.status_code == 204
+    assert second.status_code == 204  # already-revoked is still a valid end state, not an error
+
+
+def test_signing_out_one_device_does_not_affect_another_login(client):
+    client.post("/v1/auth/register", json={"email": "multi-device@example.com", "password": "correcthorse"})
+    login1 = client.post(
+        "/v1/auth/login", data={"username": "multi-device@example.com", "password": "correcthorse"}
+    ).json()
+    login2 = client.post(
+        "/v1/auth/login", data={"username": "multi-device@example.com", "password": "correcthorse"}
+    ).json()
+    headers2 = {"Authorization": f"Bearer {login2['access_token']}"}
+
+    sessions = client.get("/v1/auth/sessions", headers=headers2).json()
+    # Most recent first — sessions[0] is login2's own event, sessions[1] is login1's.
+    login1_event_id = sessions[1]["id"]
+
+    client.delete(f"/v1/auth/sessions/{login1_event_id}", headers=headers2)
+
+    # login2's own refresh token must still work — signing out a
+    # different device's session shouldn't touch this one.
+    refresh_response = client.post("/v1/auth/refresh", json={"refresh_token": login2["refresh_token"]})
+    assert refresh_response.status_code == 200
+
+
+def test_login_returns_a_refresh_token_too(client):
+    client.post("/v1/auth/register", json={"email": "refresh-basic@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login", data={"username": "refresh-basic@example.com", "password": "correcthorse"}
+    )
+    body = login.json()
+    assert "refresh_token" in body
+    assert body["refresh_token"]  # non-empty
+
+
+def test_refresh_returns_a_new_working_access_token(client):
+    client.post("/v1/auth/register", json={"email": "refresh-flow@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login", data={"username": "refresh-flow@example.com", "password": "correcthorse"}
+    )
+    refresh_token = login.json()["refresh_token"]
+
+    refreshed = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert refreshed.status_code == 200
+    new_access_token = refreshed.json()["access_token"]
+
+    me = client.get("/v1/auth/me", headers={"Authorization": f"Bearer {new_access_token}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == "refresh-flow@example.com"
+
+
+def test_refresh_rotates_the_token_so_it_cannot_be_reused(client):
+    """Core security property: a refresh token is single-use. Replaying
+    an already-redeemed one must fail, or a stolen token would work
+    forever undetected."""
+    client.post("/v1/auth/register", json={"email": "rotate@example.com", "password": "correcthorse"})
+    login = client.post("/v1/auth/login", data={"username": "rotate@example.com", "password": "correcthorse"})
+    old_refresh_token = login.json()["refresh_token"]
+
+    first_use = client.post("/v1/auth/refresh", json={"refresh_token": old_refresh_token})
+    assert first_use.status_code == 200
+    new_refresh_token = first_use.json()["refresh_token"]
+    assert new_refresh_token != old_refresh_token
+
+    replay = client.post("/v1/auth/refresh", json={"refresh_token": old_refresh_token})
+    assert replay.status_code == 401
+
+    # The rotated (new) token should still work.
+    second_use = client.post("/v1/auth/refresh", json={"refresh_token": new_refresh_token})
+    assert second_use.status_code == 200
+
+
+def test_refresh_rejects_garbage_token(client):
+    response = client.post("/v1/auth/refresh", json={"refresh_token": "not-a-real-token"})
+    assert response.status_code == 401
+
+
+def test_refresh_rejects_expired_token(client):
+    from datetime import datetime, timedelta, timezone
+    from app import models
+    from app import auth as auth_module
+
+    client.post("/v1/auth/register", json={"email": "expired-refresh@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login", data={"username": "expired-refresh@example.com", "password": "correcthorse"}
+    )
+    refresh_token = login.json()["refresh_token"]
+
+    # Force the stored token's expiry into the past, via the SAME
+    # database the test client's request handling actually uses.
+    import conftest as conftest_module
+
+    db = conftest_module.TestingSessionLocal()
+    record = (
+        db.query(models.RefreshToken)
+        .filter(models.RefreshToken.token_hash == auth_module._hash_refresh_token(refresh_token))
+        .first()
+    )
+    record.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db.commit()
+    db.close()
+
+    response = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert response.status_code == 401
+
+
+def test_logout_revokes_the_refresh_token(client):
+    client.post("/v1/auth/register", json={"email": "logout-test@example.com", "password": "correcthorse"})
+    login = client.post(
+        "/v1/auth/login", data={"username": "logout-test@example.com", "password": "correcthorse"}
+    )
+    refresh_token = login.json()["refresh_token"]
+
+    logout_response = client.post("/v1/auth/logout", json={"refresh_token": refresh_token})
+    assert logout_response.status_code == 204
+
+    refresh_after_logout = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert refresh_after_logout.status_code == 401
+
+
+def test_logout_with_unknown_token_does_not_error(client):
+    """Logging out should always succeed from the caller's perspective
+    — the end state (this token doesn't work) is already true for a
+    token that never existed, so there's nothing to reject."""
+    response = client.post("/v1/auth/logout", json={"refresh_token": "never-existed"})
+    assert response.status_code == 204
+
+
+def test_each_login_issues_its_own_independent_refresh_token(client):
+    client.post("/v1/auth/register", json={"email": "multi-refresh@example.com", "password": "correcthorse"})
+    login1 = client.post(
+        "/v1/auth/login", data={"username": "multi-refresh@example.com", "password": "correcthorse"}
+    )
+    login2 = client.post(
+        "/v1/auth/login", data={"username": "multi-refresh@example.com", "password": "correcthorse"}
+    )
+    token1 = login1.json()["refresh_token"]
+    token2 = login2.json()["refresh_token"]
+    assert token1 != token2
+
+    # Redeeming one must not invalidate the other independent session.
+    client.post("/v1/auth/refresh", json={"refresh_token": token1})
+    still_works = client.post("/v1/auth/refresh", json={"refresh_token": token2})
+    assert still_works.status_code == 200
+
+
 def test_login_records_a_real_login_event(client, auth_headers):
     headers = auth_headers()
     sessions = client.get("/v1/auth/sessions", headers=headers).json()

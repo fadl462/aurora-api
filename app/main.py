@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import models
 from .database import Base, engine
-from .routers import agents, auth, conversations, document_generation, documents, files, projects, usage
+from .routers import agents, auth, billing, conversations, document_generation, documents, files, projects, usage
 
 Base.metadata.create_all(bind=engine)
 
@@ -39,6 +39,7 @@ app.include_router(documents.router)
 app.include_router(document_generation.router)
 app.include_router(usage.router)
 app.include_router(files.router)
+app.include_router(billing.router)
 
 
 @app.get("/health")

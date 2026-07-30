@@ -66,7 +66,16 @@ We deliberately do **not** expose GPT or Gemini as pickable options anywhere in 
 
 ## What's real vs. placeholder
 
-**Real:** the database layer (SQLAlchemy models, actual persistence — verified with real HTTP requests, not mocked), the full request/response contract from the API spec, error handling with the documented `{error: {code, message, request_id}}` shape, input validation, bcrypt password hashing + JWT sessions, ownership-scoped conversations/agents/projects/documents (each with a dedicated cross-user-isolation test), real project-scoped context walls for conversations and documents, a real Anthropic model integration with graceful failure handling and real multi-model routing, a real Research Engine with Anthropic's web search tool and real extracted citations, real document CRUD backing the Canvas surface, real document *generation* (`.pptx`/`.docx`/`.xlsx` from a prompt, downloadable), real per-account token usage tracking with hard enforcement at zero, real file upload and text extraction (PDF/Word/PowerPoint/Excel/code files), and a 125-test suite.
+**Real:** the database layer (SQLAlchemy models, actual persistence — verified with real HTTP requests, not mocked), the full request/response contract from the API spec, error handling with the documented `{error: {code, message, request_id}}` shape, input validation, bcrypt password hashing + short-lived JWT access tokens backed by real, rotating, server-revocable refresh tokens (see "Sessions" below), ownership-scoped conversations/agents/projects/documents (each with a dedicated cross-user-isolation test), real project-scoped context walls for conversations and documents, a real Anthropic model integration with graceful failure handling and real multi-model routing, a real Research Engine with Anthropic's web search tool and real extracted citations, real document CRUD backing the Canvas surface, real document *generation* (`.pptx`/`.docx`/`.xlsx` from a prompt, downloadable), real per-account token usage tracking with hard enforcement at zero, real file upload and text extraction (PDF/Word/PowerPoint/Excel/code files), real sign-in activity tracking (device + best-effort geolocation), and a growing test suite (run `pytest` for the current count).
+
+## Sessions
+
+Login returns two tokens, not one:
+
+- **Access token** — a 30-minute JWT, sent as `Authorization: Bearer <token>` on every request. Short-lived on purpose: a leaked access token has a small blast radius.
+- **Refresh token** — a 30-day, server-side, single-use, rotating opaque token (`POST /v1/auth/refresh`). This is the actual mechanism behind "staying logged in" — the frontend calls it silently whenever an access token expires, rather than sending the person back to the login screen. Only its hash is ever stored (same principle as password storage), and redeeming it issues a brand-new refresh token while revoking the old one — so a stolen-and-replayed old token is immediately detectable and rejected, not silently reusable forever.
+
+`POST /v1/auth/logout` revokes the refresh token server-side — not just a client-side token deletion, which would leave a stolen refresh token still valid until natural expiry.
 
 **Placeholder, by design:** confidence scores are always `null` — see "Research Engine" above for why. No SSO/MFA (`docs/07-security-and-compliance.md`) — email/password only.
 
@@ -91,4 +100,20 @@ We deliberately do **not** expose GPT or Gemini as pickable options anywhere in 
 - `AURORA_SECRET_KEY` defaults to an insecure dev value with a loud warning if unset — always set a real one before deploying anywhere.
 - SQLite by default — see the Render section above for why this matters for deployment specifically.
 - Auth is email/password only — no SSO/MFA yet.
-- Token pricing/balances are a placeholder figure, not tied to any real billing plan yet.
+
+## Billing (real Stripe integration, opt-in)
+
+Three real plan tiers, defined in `app/billing.py` — `free` (50,000 tokens/mo, not purchasable, the default for new accounts), `pro` ($20/mo, 1,000,000 tokens/mo), and `team` ($60/mo, 5,000,000 tokens/mo). `token_allowance` isn't a display-only number — it's applied directly to a user's real `token_balance` (the same balance `orchestration.py` meters against) the moment their subscription activates.
+
+Like the Anthropic integration, this follows a strict honesty rule: if `STRIPE_SECRET_KEY` isn't set, every billing endpoint that would touch Stripe returns a clear `503 billing_not_configured` — never a fake checkout URL or a fabricated successful charge.
+
+**To turn this on:**
+1. Create a real Stripe account (or use test mode) and two real Products with recurring monthly Prices for Pro and Team.
+2. Set these on Render (or wherever this is deployed) — never paste real Stripe secret keys into a chat client or commit them to the repo:
+   - `STRIPE_SECRET_KEY`
+   - `STRIPE_PRICE_ID_PRO` / `STRIPE_PRICE_ID_TEAM` — the Price IDs from step 1
+   - `STRIPE_WEBHOOK_SECRET` — from a webhook endpoint you create in the Stripe dashboard, pointed at `<your-api-url>/v1/billing/webhook`, listening for `checkout.session.completed` and `customer.subscription.deleted`
+   - `FRONTEND_URL` — used to build the Checkout success/cancel redirect URLs
+3. Restart. `GET /v1/billing/plans` is public (needed to show pricing before login); `/checkout` and `/portal` require auth and hand back a real Stripe-hosted URL to redirect to.
+
+Downgrade-on-cancellation is deliberately simple: `customer.subscription.deleted` resets straight to Free's real allowance rather than prorating whatever was left on the paid plan — an honest, no-invented-math choice, not a bug.

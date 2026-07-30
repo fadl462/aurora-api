@@ -67,6 +67,15 @@ class DocumentOut(BaseModel):
     updated_at: datetime
 
 
+class DocumentVersionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    content: str
+    created_at: datetime
+
+
 class GeneratedDocumentCreate(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4000)
     format: Literal["pptx", "docx", "xlsx"]
@@ -125,7 +134,28 @@ class UserOut(BaseModel):
     id: str
     email: str
     name: Optional[str] = None
+    plan_tier: str
     created_at: datetime
+
+
+class PlanOut(BaseModel):
+    id: str
+    name: str
+    monthly_price_usd: int
+    token_allowance: int
+    purchasable: bool  # False for "free" — nothing to check out
+
+
+class CheckoutSessionCreate(BaseModel):
+    plan_id: str
+
+
+class CheckoutSessionOut(BaseModel):
+    checkout_url: str
+
+
+class BillingPortalOut(BaseModel):
+    portal_url: str
 
 
 class UserUpdate(BaseModel):
@@ -153,7 +183,16 @@ class LoginEventOut(BaseModel):
 
 class Token(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
 
 
 class UsageOut(BaseModel):

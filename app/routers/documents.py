@@ -1,12 +1,15 @@
 """
-GET  /v1/documents
-POST /v1/documents
-GET  /v1/documents/{id}
-PUT  /v1/documents/{id}
+GET    /v1/documents
+POST   /v1/documents
+GET    /v1/documents/{id}
+PUT    /v1/documents/{id}
+GET    /v1/documents/{id}/versions              (real version history)
+POST   /v1/documents/{id}/versions/{vid}/restore (restore a prior version)
 
 Same ownership-scoping pattern as everything else in this API.
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,6 +19,14 @@ from .. import auth, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
+
+# Throttles how often an edit creates a new version snapshot. Autosave
+# fires every ~800ms of typing pause (see CanvasContent.tsx), so
+# snapshotting on every single save would flood the history with
+# near-identical mid-sentence states. One real checkpoint every few
+# minutes of active editing is what makes "history" mean something —
+# a restore endpoint, not a per-keystroke undo log.
+VERSION_SNAPSHOT_MIN_INTERVAL = timedelta(minutes=3)
 
 
 def _not_found(document_id: str) -> HTTPException:
@@ -96,6 +107,21 @@ def get_document(
     return _get_owned_document(document_id, current_user, db)
 
 
+def _should_snapshot(document: models.Document, db: Session) -> bool:
+    latest = (
+        db.query(models.DocumentVersion)
+        .filter(models.DocumentVersion.document_id == document.id)
+        .order_by(models.DocumentVersion.created_at.desc())
+        .first()
+    )
+    if latest is None:
+        return True  # first edit ever — always worth a checkpoint of the original
+    latest_created_at = latest.created_at
+    if latest_created_at.tzinfo is None:
+        latest_created_at = latest_created_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - latest_created_at >= VERSION_SNAPSHOT_MIN_INTERVAL
+
+
 @router.put("/{document_id}", response_model=schemas.DocumentOut)
 def update_document(
     document_id: str,
@@ -104,10 +130,61 @@ def update_document(
     db: Session = Depends(get_db),
 ):
     document = _get_owned_document(document_id, current_user, db)
+    content_changing = payload.content is not None and payload.content != document.content
+    title_changing = payload.title is not None and payload.title != document.title
+
+    if (content_changing or title_changing) and _should_snapshot(document, db):
+        db.add(models.DocumentVersion(document_id=document.id, title=document.title, content=document.content))
+
     if payload.title is not None:
         document.title = payload.title
     if payload.content is not None:
         document.content = payload.content
+    document.updated_at = models.utcnow()
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+@router.get("/{document_id}/versions", response_model=list[schemas.DocumentVersionOut])
+def list_document_versions(
+    document_id: str,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    document = _get_owned_document(document_id, current_user, db)
+    return (
+        db.query(models.DocumentVersion)
+        .filter(models.DocumentVersion.document_id == document.id)
+        .order_by(models.DocumentVersion.created_at.desc())
+        .all()
+    )
+
+
+@router.post("/{document_id}/versions/{version_id}/restore", response_model=schemas.DocumentOut)
+def restore_document_version(
+    document_id: str,
+    version_id: str,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    document = _get_owned_document(document_id, current_user, db)
+    version = db.get(models.DocumentVersion, version_id)
+    if version is None or version.document_id != document.id:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "version_not_found", "message": f"No version with id {version_id}"}},
+        )
+
+    # Restoring is itself undoable: always snapshot what was live right
+    # before the restore, regardless of the normal throttle — this is a
+    # deliberate, one-off user action, not a routine autosave tick, and
+    # skipping the checkpoint here would be the one case where losing
+    # the pre-restore state could actually hurt someone.
+    db.add(models.DocumentVersion(document_id=document.id, title=document.title, content=document.content))
+
+    document.title = version.title
+    document.content = version.content
     document.updated_at = models.utcnow()
     db.commit()
     db.refresh(document)
