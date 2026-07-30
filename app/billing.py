@@ -1,62 +1,80 @@
 """
-Real subscription billing via Stripe — real plan tiers, real Checkout
-Sessions, a real webhook handler, and a real Billing Portal link.
+Real subscription billing via Paystack — not Stripe.
+
+Stripe does not operate as a direct payment processor for
+Ghana-registered businesses. Ghana is only reachable through Paystack,
+which Stripe acquired in 2020 but which runs as a fully separate
+platform — its own dashboard, its own API, its own feature set. Since
+this product needs to actually work for a Ghana-based account holder,
+billing runs on Paystack directly.
 
 Follows the same honesty principle as orchestration.py's Anthropic
-integration: if STRIPE_SECRET_KEY isn't configured, billing endpoints
-return a clear, labeled "not configured" error — never a fake checkout
-URL or a fabricated success. Anthropic's outage-handling test pattern
-(test_orchestration.py) is the template for this module's tests too.
+integration (and the Stripe module this replaced): if
+PAYSTACK_SECRET_KEY isn't configured, billing functions raise
+BillingNotConfiguredError rather than ever faking a checkout URL or a
+successful charge.
 
 Plan definitions are real, not decorative: token_allowance is what
-actually gets applied to a user's token_balance when their subscription
-activates (see apply_plan_to_user below) — the same real token economy
-app/orchestration.py already meters against, not a separate fictional
-number for display only.
+actually gets applied to a user's token_balance when a subscription
+activates (see routers/billing.py's webhook/verify handlers) — the
+same real token economy app/orchestration.py already meters against.
 
-stripe_price_id per paid plan comes from the environment
-(STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM) because Price IDs are
-specific to whoever's real Stripe account is connected — there's no
-correct hardcoded value here, unlike the token_allowance figures, which
-are this product's own numbers regardless of who's processing payment.
+paystack_plan_code per paid plan comes from the environment
+(PAYSTACK_PLAN_CODE_PRO, PAYSTACK_PLAN_CODE_TEAM) because Plan codes,
+and the real amount/currency/billing interval they represent, live in
+whoever's actual Paystack account is connected — this module doesn't
+invent or convert prices itself. monthly_price/currency here are
+purely this app's own *display* copy on the pricing cards
+(PAYSTACK_DISPLAY_PRICE_PRO/TEAM, defaulting to placeholder GHS
+figures) — keeping that in sync with the real amount configured on the
+Paystack Plan is a manual step, same as it would be with any payment
+provider's dashboard-managed pricing.
 """
 
+import hashlib
+import hmac
 import os
 from dataclasses import dataclass
 from typing import Optional
 
-import stripe
+import httpx
+
+PAYSTACK_API_BASE = "https://api.paystack.co"
+REQUEST_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
 class Plan:
     id: str
     name: str
-    monthly_price_usd: int
+    monthly_price: int
+    currency: str
     token_allowance: int
-    stripe_price_id: Optional[str]  # None for the free plan — nothing to check out
+    paystack_plan_code: Optional[str]  # None for the free plan — nothing to check out
 
 
 def _plan_catalog() -> dict[str, Plan]:
-    """A function, not a module-level constant, because the paid plans'
-    stripe_price_id depends on environment variables that tests need to
-    set/unset per-test — a constant computed once at import time
-    wouldn't see those changes."""
+    """A function, not a module-level constant, because the paid
+    plans' paystack_plan_code (and display price) depend on
+    environment variables that tests need to set/unset per-test — a
+    constant computed once at import time wouldn't see those changes."""
     return {
-        "free": Plan(id="free", name="Free", monthly_price_usd=0, token_allowance=50_000, stripe_price_id=None),
+        "free": Plan(id="free", name="Free", monthly_price=0, currency="GHS", token_allowance=50_000, paystack_plan_code=None),
         "pro": Plan(
             id="pro",
             name="Pro",
-            monthly_price_usd=20,
+            monthly_price=int(os.environ.get("PAYSTACK_DISPLAY_PRICE_PRO", "150")),
+            currency="GHS",
             token_allowance=1_000_000,
-            stripe_price_id=os.environ.get("STRIPE_PRICE_ID_PRO"),
+            paystack_plan_code=os.environ.get("PAYSTACK_PLAN_CODE_PRO"),
         ),
         "team": Plan(
             id="team",
             name="Team",
-            monthly_price_usd=60,
+            monthly_price=int(os.environ.get("PAYSTACK_DISPLAY_PRICE_TEAM", "450")),
+            currency="GHS",
             token_allowance=5_000_000,
-            stripe_price_id=os.environ.get("STRIPE_PRICE_ID_TEAM"),
+            paystack_plan_code=os.environ.get("PAYSTACK_PLAN_CODE_TEAM"),
         ),
     }
 
@@ -69,8 +87,15 @@ def list_plans() -> list[Plan]:
     return list(_plan_catalog().values())
 
 
-def is_stripe_configured() -> bool:
-    return bool(os.environ.get("STRIPE_SECRET_KEY"))
+def plan_by_paystack_code(plan_code: str) -> Optional[Plan]:
+    for plan in list_plans():
+        if plan.paystack_plan_code == plan_code:
+            return plan
+    return None
+
+
+def is_paystack_configured() -> bool:
+    return bool(os.environ.get("PAYSTACK_SECRET_KEY"))
 
 
 class BillingNotConfiguredError(Exception):
@@ -79,56 +104,99 @@ class BillingNotConfiguredError(Exception):
     configured' stub path."""
 
 
-def _client() -> None:
-    api_key = os.environ.get("STRIPE_SECRET_KEY")
+class PaystackApiError(Exception):
+    """A real, reachable Paystack API that rejected the request (bad
+    plan code, invalid subscription, etc.) — distinct from
+    BillingNotConfiguredError, which means we never even tried."""
+
+
+def _require_api_key() -> str:
+    api_key = os.environ.get("PAYSTACK_SECRET_KEY")
     if not api_key:
-        raise BillingNotConfiguredError("no STRIPE_SECRET_KEY configured")
-    stripe.api_key = api_key
+        raise BillingNotConfiguredError("no PAYSTACK_SECRET_KEY configured")
+    return api_key
 
 
-def create_checkout_session(
-    *, plan: Plan, customer_email: str, existing_customer_id: Optional[str], success_url: str, cancel_url: str
-) -> str:
-    """Returns a real, ready-to-redirect-to Stripe Checkout URL.
-    Raises BillingNotConfiguredError if Stripe isn't set up, and lets
-    any real stripe.StripeError propagate — a person clicking "Upgrade"
-    deserves the actual reason it failed, not a silently swallowed
-    error that leaves them wondering why nothing happened."""
-    if plan.stripe_price_id is None:
-        raise ValueError(f"plan '{plan.id}' has no stripe_price_id — it isn't a purchasable plan")
-    _client()
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {_require_api_key()}"}
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": plan.stripe_price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        customer=existing_customer_id,
-        customer_email=customer_email if not existing_customer_id else None,
-        client_reference_id=None,
-        metadata={"plan_id": plan.id},
+
+def initialize_transaction(*, plan: Plan, customer_email: str, callback_url: str) -> dict:
+    """Returns {"authorization_url": ..., "reference": ...}. The
+    authorization_url is a real, ready-to-redirect-to Paystack checkout
+    page. Raises BillingNotConfiguredError if Paystack isn't set up,
+    ValueError if the plan itself has no real plan code attached, and
+    PaystackApiError for anything Paystack's API itself rejects — a
+    person clicking "Upgrade" deserves the actual reason it failed."""
+    if plan.paystack_plan_code is None:
+        raise ValueError(f"plan '{plan.id}' has no paystack_plan_code — it isn't a purchasable plan")
+
+    response = httpx.post(
+        f"{PAYSTACK_API_BASE}/transaction/initialize",
+        headers=_auth_headers(),
+        json={"email": customer_email, "plan": plan.paystack_plan_code, "callback_url": callback_url},
+        timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    return session.url
+    body = response.json()
+    if not body.get("status"):
+        raise PaystackApiError(body.get("message") or "Paystack rejected the checkout request.")
+
+    data = body["data"]
+    return {"authorization_url": data["authorization_url"], "reference": data["reference"]}
 
 
-def create_billing_portal_session(*, stripe_customer_id: str, return_url: str) -> str:
-    """Real Stripe-hosted portal where a subscriber manages or cancels
-    their own subscription — Stripe's own UI, not something this app
-    has to build and maintain itself."""
-    _client()
-    session = stripe.billing_portal.Session.create(customer=stripe_customer_id, return_url=return_url)
-    return session.url
+def verify_transaction(reference: str) -> dict:
+    """Confirms a transaction's real status directly with Paystack,
+    rather than trusting a client-supplied 'it worked' — used both by
+    the webhook handler's charge.success path and by the settings
+    page's synchronous return-from-checkout flow, so an upgrade doesn't
+    depend solely on a webhook arriving promptly."""
+    response = httpx.get(
+        f"{PAYSTACK_API_BASE}/transaction/verify/{reference}",
+        headers=_auth_headers(),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    body = response.json()
+    if not body.get("status"):
+        raise PaystackApiError(body.get("message") or "Couldn't verify that transaction.")
+    return body["data"]
 
 
-def construct_webhook_event(payload: bytes, signature_header: str) -> stripe.Event:
-    """Raises stripe.SignatureVerificationError on a bad/missing
-    signature — the caller must not process a webhook body it can't
-    verify actually came from Stripe."""
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    if not webhook_secret:
-        raise BillingNotConfiguredError("no STRIPE_WEBHOOK_SECRET configured")
-    return stripe.Webhook.construct_event(payload, signature_header, webhook_secret)
+def disable_subscription(*, subscription_code: str, email_token: str) -> None:
+    """Paystack's real cancel-subscription call. Requires the
+    email_token Paystack hands back in the subscription.create webhook
+    payload — there's no way to cancel with just the subscription code
+    alone, by Paystack's own design."""
+    response = httpx.post(
+        f"{PAYSTACK_API_BASE}/subscription/disable",
+        headers=_auth_headers(),
+        json={"code": subscription_code, "token": email_token},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    body = response.json()
+    if not body.get("status"):
+        raise PaystackApiError(body.get("message") or "Couldn't cancel that subscription.")
 
 
-def plan_id_from_checkout_session(session: dict) -> Optional[str]:
-    return (session.get("metadata") or {}).get("plan_id")
+def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Paystack signs webhook bodies with HMAC-SHA512 using your own
+    secret key (no separate webhook signing secret, unlike Stripe) —
+    this must pass before a webhook body is trusted at all."""
+    api_key = os.environ.get("PAYSTACK_SECRET_KEY")
+    if not api_key or not signature_header:
+        return False
+    computed = hmac.new(api_key.encode("utf-8"), raw_body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(computed, signature_header)
+
+
+def plan_id_from_transaction_data(data: dict) -> Optional[str]:
+    """Real subscription-linked transactions (initialized with a
+    `plan` code) carry that plan code back in the verify/webhook
+    payload — either as a plain string under 'plan', or nested under
+    'plan_object'. Maps it back to this app's own plan id, returning
+    None (never a guess) if it can't be matched to a real plan."""
+    plan_code = data.get("plan") or (data.get("plan_object") or {}).get("plan_code")
+    if not plan_code:
+        return None
+    plan = plan_by_paystack_code(plan_code)
+    return plan.id if plan else None

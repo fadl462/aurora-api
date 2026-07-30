@@ -101,19 +101,27 @@ Login returns two tokens, not one:
 - SQLite by default — see the Render section above for why this matters for deployment specifically.
 - Auth is email/password only — no SSO/MFA yet.
 
-## Billing (real Stripe integration, opt-in)
+## Billing (real Paystack integration, opt-in)
 
-Three real plan tiers, defined in `app/billing.py` — `free` (50,000 tokens/mo, not purchasable, the default for new accounts), `pro` ($20/mo, 1,000,000 tokens/mo), and `team` ($60/mo, 5,000,000 tokens/mo). `token_allowance` isn't a display-only number — it's applied directly to a user's real `token_balance` (the same balance `orchestration.py` meters against) the moment their subscription activates.
+Billing runs on **Paystack, not Stripe** — Stripe doesn't operate as a direct payment processor for Ghana-registered businesses (Ghana is only reachable via Paystack, which Stripe acquired in 2020 but which is a fully separate platform with its own API, dashboard, and feature set). Paystack also brings mobile money support, which matters far more for this market than card-only checkout.
 
-Like the Anthropic integration, this follows a strict honesty rule: if `STRIPE_SECRET_KEY` isn't set, every billing endpoint that would touch Stripe returns a clear `503 billing_not_configured` — never a fake checkout URL or a fabricated successful charge.
+Three real plan tiers, defined in `app/billing.py` — `free` (50,000 tokens/mo, not purchasable, the default for new accounts), `pro` (GH₵150/mo by default, 1,000,000 tokens/mo), and `team` (GH₵450/mo by default, 5,000,000 tokens/mo). `token_allowance` isn't a display-only number — it's applied directly to a user's real `token_balance` (the same balance `orchestration.py` meters against) the moment a subscription activates. The display prices are placeholders (`PAYSTACK_DISPLAY_PRICE_PRO`/`TEAM` env vars) — the real amount charged is whatever's configured on the actual Paystack Plan; keeping those two in sync is a manual step.
+
+Like the Anthropic integration, this follows a strict honesty rule: if `PAYSTACK_SECRET_KEY` isn't set, every billing endpoint that would touch Paystack returns a clear `503 billing_not_configured` — never a fake checkout URL or a fabricated successful charge.
 
 **To turn this on:**
-1. Create a real Stripe account (or use test mode) and two real Products with recurring monthly Prices for Pro and Team.
-2. Set these on Render (or wherever this is deployed) — never paste real Stripe secret keys into a chat client or commit them to the repo:
-   - `STRIPE_SECRET_KEY`
-   - `STRIPE_PRICE_ID_PRO` / `STRIPE_PRICE_ID_TEAM` — the Price IDs from step 1
-   - `STRIPE_WEBHOOK_SECRET` — from a webhook endpoint you create in the Stripe dashboard, pointed at `<your-api-url>/v1/billing/webhook`, listening for `checkout.session.completed` and `customer.subscription.deleted`
-   - `FRONTEND_URL` — used to build the Checkout success/cancel redirect URLs
-3. Restart. `GET /v1/billing/plans` is public (needed to show pricing before login); `/checkout` and `/portal` require auth and hand back a real Stripe-hosted URL to redirect to.
+1. Create a real Paystack account (test mode is fine to start) at `dashboard.paystack.com`.
+2. Create two real Plans (Product catalog → Plans) — one for Pro, one for Team, each with a real monthly amount in GHS. Copy each Plan's **Plan Code** (`PLN_...`).
+3. Set these on Render (or wherever this is deployed) — never paste a real Paystack secret key into a chat client or commit it to the repo:
+   - `PAYSTACK_SECRET_KEY`
+   - `PAYSTACK_PLAN_CODE_PRO` / `PAYSTACK_PLAN_CODE_TEAM` — the Plan Codes from step 2
+   - `PAYSTACK_DISPLAY_PRICE_PRO` / `PAYSTACK_DISPLAY_PRICE_TEAM` — optional; the GHS number shown on the pricing cards (should match what the Plan actually charges)
+   - `FRONTEND_URL` — used to build the post-checkout redirect URL
+4. Add a webhook in Paystack (Settings → API Keys & Webhooks) pointed at `<your-api-url>/v1/billing/webhook`. Unlike Stripe, Paystack signs webhooks with your own secret key directly (HMAC-SHA512) — there's no separate webhook signing secret to configure.
+5. Restart. `GET /v1/billing/plans` is public (needed to show pricing before login); `/checkout` requires auth and hands back a real Paystack checkout URL.
 
-Downgrade-on-cancellation is deliberately simple: `customer.subscription.deleted` resets straight to Free's real allowance rather than prorating whatever was left on the paid plan — an honest, no-invented-math choice, not a bug.
+Two things worth knowing about how this differs from a typical Stripe setup:
+- **No hosted "billing portal."** Paystack doesn't offer a Stripe-Billing-Portal equivalent, so "manage billing" is a real in-app action (`POST /v1/billing/cancel`) that calls Paystack's own cancel-subscription API directly, rather than redirecting to an external page.
+- **Verification happens twice, deliberately.** `GET /v1/billing/verify` confirms the transaction synchronously the moment someone returns from checkout (so the upgrade doesn't depend on a webhook arriving promptly), while the webhook remains the durable source of truth for `subscription.create` (which carries the subscription code needed for cancellation) and `subscription.disable`.
+
+Downgrade-on-cancellation is deliberately simple: resets straight to Free's real allowance rather than prorating whatever was left on the paid plan — an honest, no-invented-math choice, not a bug.

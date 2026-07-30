@@ -1,18 +1,26 @@
+import hashlib
+import hmac
 from unittest.mock import MagicMock, patch
 
+from app import models
 
-def test_list_plans_is_public_no_auth_needed(client):
+
+def test_list_plans_is_public_no_auth_required(client):
     response = client.get("/v1/billing/plans")
     assert response.status_code == 200
-    plans = response.json()
-    ids = {p["id"] for p in plans}
+    ids = {p["id"] for p in response.json()}
     assert ids == {"free", "pro", "team"}
 
 
-def test_free_plan_marked_not_purchasable(client):
+def test_list_plans_free_plan_is_not_purchasable(client):
     plans = client.get("/v1/billing/plans").json()
     free = next(p for p in plans if p["id"] == "free")
     assert free["purchasable"] is False
+
+
+def test_list_plans_shows_currency(client):
+    plans = client.get("/v1/billing/plans").json()
+    assert all(p["currency"] == "GHS" for p in plans)
 
 
 def test_checkout_requires_auth(client):
@@ -20,121 +28,244 @@ def test_checkout_requires_auth(client):
     assert response.status_code == 401
 
 
-def test_checkout_returns_503_when_stripe_not_configured(client, auth_headers, monkeypatch):
-    monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
-    monkeypatch.setenv("STRIPE_PRICE_ID_PRO", "price_test_pro")
+def test_checkout_returns_503_when_paystack_not_configured(client, auth_headers, monkeypatch):
+    monkeypatch.delenv("PAYSTACK_SECRET_KEY", raising=False)
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_PRO", "PLN_test")
     headers = auth_headers()
-
     response = client.post("/v1/billing/checkout", json={"plan_id": "pro"}, headers=headers)
     assert response.status_code == 503
     assert response.json()["detail"]["error"]["code"] == "billing_not_configured"
 
 
-def test_checkout_rejects_unknown_plan(client, auth_headers, monkeypatch):
-    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
-    headers = auth_headers()
-    response = client.post("/v1/billing/checkout", json={"plan_id": "nonexistent"}, headers=headers)
-    assert response.status_code == 404
-
-
-def test_checkout_rejects_free_plan_as_not_purchasable(client, auth_headers, monkeypatch):
-    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
+def test_checkout_returns_400_for_unpurchasable_plan(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
     headers = auth_headers()
     response = client.post("/v1/billing/checkout", json={"plan_id": "free"}, headers=headers)
     assert response.status_code == 400
     assert response.json()["detail"]["error"]["code"] == "plan_not_purchasable"
 
 
-def test_checkout_returns_real_url_when_stripe_configured(client, auth_headers, monkeypatch):
-    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
-    monkeypatch.setenv("STRIPE_PRICE_ID_PRO", "price_test_pro")
+def test_checkout_returns_404_for_unknown_plan(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers()
+    response = client.post("/v1/billing/checkout", json={"plan_id": "not-a-real-plan"}, headers=headers)
+    assert response.status_code == 404
+
+
+def test_checkout_returns_real_checkout_url_on_success(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_PRO", "PLN_test")
     headers = auth_headers()
 
-    fake_session = MagicMock()
-    fake_session.url = "https://checkout.stripe.com/pay/cs_test_fake"
-
-    with patch("app.billing.stripe.checkout.Session.create", return_value=fake_session):
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "status": True,
+        "data": {"authorization_url": "https://checkout.paystack.com/xyz", "reference": "ref_xyz"},
+    }
+    with patch("app.billing.httpx.post", return_value=fake_response):
         response = client.post("/v1/billing/checkout", json={"plan_id": "pro"}, headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["checkout_url"] == "https://checkout.stripe.com/pay/cs_test_fake"
+    assert response.json()["checkout_url"] == "https://checkout.paystack.com/xyz"
 
 
-def test_portal_requires_auth(client):
-    response = client.get("/v1/billing/portal")
+def test_verify_requires_auth(client):
+    response = client.get("/v1/billing/verify?reference=abc")
     assert response.status_code == 401
 
 
-def test_portal_requires_existing_stripe_customer(client, auth_headers):
+def test_verify_applies_plan_on_successful_transaction(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_PRO", "PLN_test_pro")
     headers = auth_headers()
-    response = client.get("/v1/billing/portal", headers=headers)
-    assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "no_stripe_customer"
 
-
-def test_webhook_rejects_missing_signature(client):
-    response = client.post("/v1/billing/webhook", content=b'{"type": "checkout.session.completed"}')
-    assert response.status_code in (400, 503)  # 503 if webhook secret also unset in this test env
-
-
-def test_webhook_checkout_completed_upgrades_user_plan(client, auth_headers, db_session, monkeypatch):
-    """Simulates a real Stripe webhook event by calling the handler
-    function directly with a realistic payload shape — the signature
-    verification itself is tested separately in test_billing.py, this
-    test is about what happens to the user's plan/balance once a
-    legitimately-verified event is processed."""
-    from app import models
-    from app.routers import billing as billing_router
-
-    headers = auth_headers("checkout-webhook@example.com", "correcthorse")
-    user = db_session.query(models.User).filter(models.User.email == "checkout-webhook@example.com").first()
-    assert user.plan_tier == "free"
-
-    fake_session_data = {
-        "customer": "cus_new123",
-        "subscription": "sub_new123",
-        "customer_details": {"email": "checkout-webhook@example.com"},
-        "metadata": {"plan_id": "pro"},
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "status": True,
+        "data": {
+            "status": "success",
+            "plan": "PLN_test_pro",
+            "customer": {"customer_code": "CUS_abc123", "email": "verify-test@example.com"},
+        },
     }
+    with patch("app.billing.httpx.get", return_value=fake_response):
+        response = client.get("/v1/billing/verify?reference=ref_abc", headers=headers)
 
-    billing_router._handle_checkout_completed(fake_session_data, db_session)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verified"] is True
+    assert body["plan_tier"] == "pro"
 
-    db_session.refresh(user)
-    assert user.plan_tier == "pro"
-    assert user.stripe_customer_id == "cus_new123"
-    assert user.stripe_subscription_id == "sub_new123"
-    assert user.token_balance == 1_000_000
+    me = client.get("/v1/auth/me", headers=headers).json()
+    assert me["plan_tier"] == "pro"
 
 
-def test_webhook_subscription_cancelled_reverts_to_free(client, auth_headers, db_session):
-    from app import models
-    from app.routers import billing as billing_router
+def test_verify_does_not_apply_plan_when_transaction_not_successful(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers()
 
-    headers = auth_headers("cancel-webhook@example.com", "correcthorse")
-    user = db_session.query(models.User).filter(models.User.email == "cancel-webhook@example.com").first()
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"status": True, "data": {"status": "failed"}}
+    with patch("app.billing.httpx.get", return_value=fake_response):
+        response = client.get("/v1/billing/verify?reference=ref_abc", headers=headers)
+
+    assert response.json()["verified"] is False
+    me = client.get("/v1/auth/me", headers=headers).json()
+    assert me["plan_tier"] == "free"
+
+
+def test_verify_does_not_apply_plan_when_plan_code_unrecognized(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers()
+
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "status": True,
+        "data": {"status": "success", "plan": "PLN_totally_unknown", "customer": {}},
+    }
+    with patch("app.billing.httpx.get", return_value=fake_response):
+        response = client.get("/v1/billing/verify?reference=ref_abc", headers=headers)
+
+    assert response.json()["verified"] is False
+
+
+def test_cancel_requires_auth(client):
+    response = client.post("/v1/billing/cancel")
+    assert response.status_code == 401
+
+
+def test_cancel_returns_400_with_no_active_subscription(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers()
+    response = client.post("/v1/billing/cancel", headers=headers)
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["code"] == "no_active_subscription"
+
+
+def test_cancel_downgrades_to_free_on_success(client, auth_headers, monkeypatch, db_session):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_PRO", "PLN_test_pro")
+    headers = auth_headers()
+
+    # Simulate an already-active Pro subscriber.
+    me = client.get("/v1/auth/me", headers=headers).json()
+    user = db_session.get(models.User, me["id"])
     user.plan_tier = "pro"
-    user.stripe_subscription_id = "sub_to_cancel"
-    user.token_balance = 900_000
+    user.token_balance = 1_000_000
+    user.paystack_subscription_code = "SUB_abc"
+    user.paystack_email_token = "tok_abc"
     db_session.commit()
 
-    billing_router._handle_subscription_cancelled({"id": "sub_to_cancel"}, db_session)
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"status": True, "message": "Subscription disabled"}
+    with patch("app.billing.httpx.post", return_value=fake_response):
+        response = client.post("/v1/billing/cancel", headers=headers)
 
-    db_session.refresh(user)
-    assert user.plan_tier == "free"
-    assert user.stripe_subscription_id is None
-    assert user.token_balance == 50_000
+    assert response.status_code == 200
+    assert response.json()["plan_tier"] == "free"
+
+    me_after = client.get("/v1/auth/me", headers=headers).json()
+    assert me_after["plan_tier"] == "free"
 
 
-def test_webhook_checkout_completed_ignores_unknown_customer(db_session):
-    """No matching user by customer id or email — must not raise, and
-    must not silently create/corrupt anything. A no-op is the only
-    honest behavior here."""
-    from app.routers import billing as billing_router
+def _sign(body: bytes, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), body, hashlib.sha512).hexdigest()
 
-    fake_session_data = {
-        "customer": "cus_totally_unknown",
-        "subscription": "sub_x",
-        "customer_details": {"email": "nobody-real@example.com"},
-        "metadata": {"plan_id": "pro"},
+
+def test_webhook_rejects_invalid_signature(client, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    body = b'{"event":"charge.success","data":{}}'
+    response = client.post(
+        "/v1/billing/webhook", content=body, headers={"x-paystack-signature": "bogus"}
+    )
+    assert response.status_code == 400
+
+
+def test_webhook_returns_503_when_not_configured(client, monkeypatch):
+    monkeypatch.delenv("PAYSTACK_SECRET_KEY", raising=False)
+    body = b'{"event":"charge.success","data":{}}'
+    response = client.post("/v1/billing/webhook", content=body, headers={"x-paystack-signature": "whatever"})
+    assert response.status_code == 503
+
+
+def test_webhook_charge_success_applies_plan_to_matching_user(client, auth_headers, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_TEAM", "PLN_test_team")
+    headers = auth_headers("webhook-charge@example.com", "correcthorse")
+
+    import json
+
+    body_dict = {
+        "event": "charge.success",
+        "data": {"plan": "PLN_test_team", "customer": {"customer_code": "CUS_xyz", "email": "webhook-charge@example.com"}},
     }
-    billing_router._handle_checkout_completed(fake_session_data, db_session)  # should not raise
+    body = json.dumps(body_dict).encode()
+    signature = _sign(body, "sk_test_fake")
+
+    response = client.post("/v1/billing/webhook", content=body, headers={"x-paystack-signature": signature})
+    assert response.status_code == 200
+
+    me = client.get("/v1/auth/me", headers=headers).json()
+    assert me["plan_tier"] == "team"
+
+
+def test_webhook_subscription_create_stores_subscription_details(client, auth_headers, monkeypatch, db_session):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers("webhook-sub@example.com", "correcthorse")
+    me = client.get("/v1/auth/me", headers=headers).json()
+
+    import json
+
+    body_dict = {
+        "event": "subscription.create",
+        "data": {
+            "subscription_code": "SUB_new123",
+            "email_token": "tok_new123",
+            "customer": {"customer_code": "CUS_new123", "email": "webhook-sub@example.com"},
+        },
+    }
+    body = json.dumps(body_dict).encode()
+    signature = _sign(body, "sk_test_fake")
+    client.post("/v1/billing/webhook", content=body, headers={"x-paystack-signature": signature})
+
+    user = db_session.get(models.User, me["id"])
+    assert user.paystack_subscription_code == "SUB_new123"
+    assert user.paystack_email_token == "tok_new123"
+
+
+def test_webhook_subscription_disable_downgrades_user(client, auth_headers, monkeypatch, db_session):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    headers = auth_headers("webhook-disable@example.com", "correcthorse")
+    me = client.get("/v1/auth/me", headers=headers).json()
+
+    user = db_session.get(models.User, me["id"])
+    user.plan_tier = "pro"
+    user.token_balance = 1_000_000
+    user.paystack_subscription_code = "SUB_to_disable"
+    db_session.commit()
+
+    import json
+
+    body_dict = {"event": "subscription.disable", "data": {"subscription_code": "SUB_to_disable"}}
+    body = json.dumps(body_dict).encode()
+    signature = _sign(body, "sk_test_fake")
+    client.post("/v1/billing/webhook", content=body, headers={"x-paystack-signature": signature})
+
+    me_after = client.get("/v1/auth/me", headers=headers).json()
+    assert me_after["plan_tier"] == "free"
+
+
+def test_webhook_ignores_unmatched_customer_without_crashing(client, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("PAYSTACK_PLAN_CODE_PRO", "PLN_test")
+
+    import json
+
+    body_dict = {
+        "event": "charge.success",
+        "data": {"plan": "PLN_test", "customer": {"customer_code": "CUS_ghost", "email": "nobody@example.com"}},
+    }
+    body = json.dumps(body_dict).encode()
+    signature = _sign(body, "sk_test_fake")
+    response = client.post("/v1/billing/webhook", content=body, headers={"x-paystack-signature": signature})
+    assert response.status_code == 200  # accepted, just nothing to apply it to

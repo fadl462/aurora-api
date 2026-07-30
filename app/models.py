@@ -38,13 +38,18 @@ class User(Base):
     name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
     token_balance = Column(Integer, nullable=False, default=STARTING_TOKEN_BALANCE)
-    # "free" until a real Stripe checkout actually completes — see
-    # app/billing.py and the webhook handler in routers/billing.py.
-    # Never set directly from client input; only the webhook (which
-    # verifies Stripe's signature) or an admin action should change this.
+    # "free" until a real Paystack transaction actually completes — see
+    # app/billing.py and the webhook/verify handlers in
+    # routers/billing.py. Never set directly from client input; only a
+    # verified Paystack event (webhook signature checked, or a
+    # server-side transaction verify call) should change this.
     plan_tier = Column(String, nullable=False, default="free")
-    stripe_customer_id = Column(String, nullable=True, unique=True)
-    stripe_subscription_id = Column(String, nullable=True)
+    paystack_customer_code = Column(String, nullable=True, unique=True)
+    paystack_subscription_code = Column(String, nullable=True)
+    # Paystack requires this alongside subscription_code to disable a
+    # subscription via their API — it's handed to us in the
+    # subscription.create webhook payload, not something we generate.
+    paystack_email_token = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")

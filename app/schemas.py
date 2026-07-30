@@ -141,7 +141,8 @@ class UserOut(BaseModel):
 class PlanOut(BaseModel):
     id: str
     name: str
-    monthly_price_usd: int
+    monthly_price: int
+    currency: str
     token_allowance: int
     purchasable: bool  # False for "free" — nothing to check out
 
@@ -154,8 +155,9 @@ class CheckoutSessionOut(BaseModel):
     checkout_url: str
 
 
-class BillingPortalOut(BaseModel):
-    portal_url: str
+class CheckoutVerifyOut(BaseModel):
+    plan_tier: str
+    verified: bool
 
 
 class UserUpdate(BaseModel):
